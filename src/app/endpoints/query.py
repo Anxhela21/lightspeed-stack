@@ -3,6 +3,7 @@
 import ast
 import json
 import logging
+import traceback
 import re
 from datetime import UTC, datetime
 from typing import Annotated, Any, Optional, cast
@@ -23,6 +24,7 @@ from llama_stack_client.types.agents.turn_create_params import (
 from llama_stack_client.types.model_list_response import ModelListResponse
 from llama_stack_client.types.shared.interleaved_content_item import TextContentItem
 from llama_stack_client.types.tool_execution_step import ToolExecutionStep
+
 
 import constants
 import metrics
@@ -732,12 +734,8 @@ async def retrieve_response(  # pylint: disable=too-many-locals,too-many-branche
             ),
         }
 
-        vector_db_ids = [
-            vector_db.identifier for vector_db in await client.vector_dbs.list()
-        ]
-        toolgroups = (get_rag_toolgroups(vector_db_ids) or []) + [
-            mcp_server.name for mcp_server in configuration.mcp_servers
-        ]
+        # Skip RAG toolgroups since we'll query Solr directly
+        toolgroups = [mcp_server.name for mcp_server in configuration.mcp_servers]
         # Convert empty list to None for consistency with existing behavior
         if not toolgroups:
             toolgroups = None
@@ -752,8 +750,44 @@ async def retrieve_response(  # pylint: disable=too-many-locals,too-many-branche
         for doc in query_request.get_documents()
     ]
 
+    # Query vector databases for RAG chunks
+    vector_dbs = await client.vector_dbs.list()
+    vector_db_ids = [vdb.identifier for vdb in vector_dbs]
+
+    rag_context = ""
+    try:
+        # Use the first available vector database if any exist
+        if vector_db_ids:
+            vector_db_id = vector_db_ids[0]  # Use first available vector DB
+
+            query_response = await client.vector_io.query(
+                vector_db_id=vector_db_id,
+                query=query_request.query,
+                params={"k": 5, "score_threshold": 0.0 }
+            )
+            logger.info(f"The query response total payload:{query_response}")
+
+            if query_response.chunks:
+                rag_context = "\n\nRelevant context from knowledge base:\n"
+                for i, chunk in enumerate(query_response.chunks[:3], 1):
+                    rag_context += f"{i}. {chunk.content}\n"
+
+                logger.info(
+                    f"Retrieved {len(query_response.chunks)} chunks from vector DB"
+                )
+
+    except Exception as e:
+        logger.warning(f"Failed to query vector database for chunks: {e}")
+        logger.debug(f"Vector DB query error details: {traceback.format_exc()}")
+        # Continue without RAG context
+
+    # Add RAG context to the user message if available
+    user_content = query_request.query
+    if rag_context:
+        user_content += rag_context
+
     response = await agent.create_turn(
-        messages=[UserMessage(role="user", content=query_request.query)],
+        messages=[UserMessage(role="user", content=user_content)],
         session_id=session_id,
         documents=documents,
         stream=False,
