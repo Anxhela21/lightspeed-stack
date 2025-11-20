@@ -3,10 +3,11 @@
 import ast
 import json
 import logging
-import traceback
 import re
+import traceback
 from datetime import UTC, datetime
 from typing import Annotated, Any, Optional, cast
+from urllib.parse import urljoin
 
 from fastapi import APIRouter, Depends, HTTPException, Request, status
 from llama_stack_client import (
@@ -17,14 +18,13 @@ from llama_stack_client.lib.agents.event_logger import interleaved_content_as_st
 from llama_stack_client.types import Shield, UserMessage  # type: ignore
 from llama_stack_client.types.agents.turn import Turn
 from llama_stack_client.types.agents.turn_create_params import (
+    Document,
     Toolgroup,
     ToolgroupAgentToolGroupWithArgs,
-    Document,
 )
 from llama_stack_client.types.model_list_response import ModelListResponse
 from llama_stack_client.types.shared.interleaved_content_item import TextContentItem
 from llama_stack_client.types.tool_execution_step import ToolExecutionStep
-
 
 import constants
 import metrics
@@ -41,6 +41,7 @@ from models.requests import Attachment, QueryRequest
 from models.responses import (
     ForbiddenResponse,
     QueryResponse,
+    RAGChunk,
     ReferencedDocument,
     ToolCall,
     UnauthorizedResponse,
@@ -48,25 +49,30 @@ from models.responses import (
 from utils.endpoints import (
     check_configuration_loaded,
     get_agent,
-    get_topic_summary_system_prompt,
-    get_temp_agent,
     get_system_prompt,
+    get_temp_agent,
+    get_topic_summary_system_prompt,
     store_conversation_into_cache,
     validate_conversation_ownership,
     validate_model_provider_override,
 )
+from utils.mcp_headers import handle_mcp_headers_with_toolgroups, mcp_headers_dependency
 from utils.quota import (
-    get_available_quotas,
     check_tokens_available,
     consume_tokens,
+    get_available_quotas,
 )
-from utils.mcp_headers import handle_mcp_headers_with_toolgroups, mcp_headers_dependency
+from utils.token_counter import TokenCounter, extract_and_update_token_metrics
 from utils.transcripts import store_transcript
 from utils.types import TurnSummary
-from utils.token_counter import extract_and_update_token_metrics, TokenCounter
 
 logger = logging.getLogger("app.endpoints.handlers")
 router = APIRouter(tags=["query"])
+
+# When OFFLINE is False, use reference_url for chunk source
+# When OFFLINE is True, use parent_id for chunk source
+# TODO: move this setting to a higher level configuration
+OFFLINE = True
 
 query_response: dict[int | str, dict[str, Any]] = {
     200: {
@@ -296,15 +302,18 @@ async def query_endpoint_handler_base(  # pylint: disable=R0914
                 user_conversation=user_conversation, query_request=query_request
             ),
         )
-        summary, conversation_id, referenced_documents, token_usage = (
-            await retrieve_response_func(
-                client,
-                llama_stack_model_id,
-                query_request,
-                token,
-                mcp_headers=mcp_headers,
-                provider_id=provider_id,
-            )
+        (
+            summary,
+            conversation_id,
+            referenced_documents,
+            token_usage,
+        ) = await retrieve_response_func(
+            client,
+            llama_stack_model_id,
+            query_request,
+            token,
+            mcp_headers=mcp_headers,
+            provider_id=provider_id,
         )
 
         # Get the initial topic summary for the conversation
@@ -811,6 +820,12 @@ async def retrieve_response(  # pylint: disable=too-many-locals,too-many-branche
 
                             )
                         )
+                # Store chunks and scores for later inclusion in TurnSummary
+                retrieved_chunks = query_response.chunks
+                retrieved_scores = (
+                    query_response.scores if hasattr(query_response, "scores") else []
+                )
+
                 logger.info(
                     f"Extracted {len(doc_ids_from_chunks)} unique document IDs from chunks"
                 )
@@ -819,6 +834,54 @@ async def retrieve_response(  # pylint: disable=too-many-locals,too-many-branche
         logger.warning(f"Failed to query vector database for chunks: {e}")
         logger.debug(f"Vector DB query error details: {traceback.format_exc()}")
         # Continue without RAG chunks
+
+    # Convert retrieved chunks to RAGChunk format
+    rag_chunks = []
+    for i, chunk in enumerate(retrieved_chunks):
+        # Extract source from chunk metadata based on OFFLINE flag
+        source = None
+        if chunk.metadata:
+            if OFFLINE:
+                parent_id = chunk.metadata.get("parent_id")
+                if parent_id:
+                    source = urljoin("https://mimir.corp.redhat.com", parent_id)
+            else:
+                source = chunk.metadata.get("reference_url")
+
+        # Get score from retrieved_scores list if available
+        score = retrieved_scores[i] if i < len(retrieved_scores) else None
+
+        rag_chunks.append(
+            RAGChunk(
+                content=chunk.content,
+                source=source,
+                score=score,
+            )
+        )
+
+    # Convert retrieved chunks to RAGChunk format
+    rag_chunks = []
+    for i, chunk in enumerate(retrieved_chunks):
+        # Extract source from chunk metadata based on OFFLINE flag
+        source = None
+        if chunk.metadata:
+            if OFFLINE:
+                parent_id = chunk.metadata.get("parent_id")
+                if parent_id:
+                    source = urljoin("https://mimir.corp.redhat.com", parent_id)
+            else:
+                source = chunk.metadata.get("reference_url")
+
+        # Get score from retrieved_scores list if available
+        score = retrieved_scores[i] if i < len(retrieved_scores) else None
+
+        rag_chunks.append(
+            RAGChunk(
+                content=chunk.content,
+                source=source,
+                score=score,
+            )
+        )
 
     summary = TurnSummary(
         llm_response=(
