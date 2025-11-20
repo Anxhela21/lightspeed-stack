@@ -601,7 +601,7 @@ def parse_metadata_from_text_item(
             url = data.get("docs_url")
             title = data.get("title")
             if url and title:
-                return ReferencedDocument(doc_url=url, doc_title=title)
+                return ReferencedDocument(doc_url=url, doc_title=title, doc_id=None)
             logger.debug("Invalid metadata block (missing url or title): %s", block)
         except (ValueError, SyntaxError) as e:
             logger.debug("Failed to parse metadata block: %s | Error: %s", block, e)
@@ -750,41 +750,8 @@ async def retrieve_response(  # pylint: disable=too-many-locals,too-many-branche
         for doc in query_request.get_documents()
     ]
 
-    # Query vector databases for RAG chunks
-    vector_dbs = await client.vector_dbs.list()
-    vector_db_ids = [vdb.identifier for vdb in vector_dbs]
-
-    rag_context = ""
-    try:
-        # Use the first available vector database if any exist
-        if vector_db_ids:
-            vector_db_id = vector_db_ids[0]  # Use first available vector DB
-
-            query_response = await client.vector_io.query(
-                vector_db_id=vector_db_id,
-                query=query_request.query,
-                params={"k": 5, "score_threshold": 0.0 }
-            )
-            logger.info(f"The query response total payload:{query_response}")
-
-            if query_response.chunks:
-                rag_context = "\n\nRelevant context from knowledge base:\n"
-                for i, chunk in enumerate(query_response.chunks[:3], 1):
-                    rag_context += f"{i}. {chunk.content}\n"
-
-                logger.info(
-                    f"Retrieved {len(query_response.chunks)} chunks from vector DB"
-                )
-
-    except Exception as e:
-        logger.warning(f"Failed to query vector database for chunks: {e}")
-        logger.debug(f"Vector DB query error details: {traceback.format_exc()}")
-        # Continue without RAG context
-
-    # Add RAG context to the user message if available
+    # Use the original query without adding RAG context to the user message
     user_content = query_request.query
-    if rag_context:
-        user_content += rag_context
 
     response = await agent.create_turn(
         messages=[UserMessage(role="user", content=user_content)],
@@ -794,6 +761,64 @@ async def retrieve_response(  # pylint: disable=too-many-locals,too-many-branche
         toolgroups=toolgroups,
     )
     response = cast(Turn, response)
+
+    # Extract RAG chunks from vector DB query response
+    rag_chunks = []
+    doc_ids_from_chunks = []
+    try:
+        # Use the first available vector database if any exist
+        vector_dbs = await client.vector_dbs.list()
+        vector_db_ids = [vdb.identifier for vdb in vector_dbs]
+
+        if vector_db_ids:
+            vector_db_id = vector_db_ids[0]  # Use first available vector DB
+
+            query_response = await client.vector_io.query(
+                vector_db_id=vector_db_id,
+                query=query_request.query,
+                params={"k": 5, "score_threshold": 0.0},
+            )
+
+            logger.info(f"The query response total payload: {query_response}")
+
+            if query_response.chunks:
+                from models.responses import RAGChunk, ReferencedDocument
+
+                rag_chunks = [
+                    RAGChunk(
+                        content=str(chunk.content),  # Convert to string if needed
+                        source=getattr(chunk, "doc_id", None)
+                        or getattr(chunk, "source", None),
+                        score=getattr(chunk, "score", None),
+                    )
+                    for chunk in query_response.chunks[:5]  # Limit to top 5 chunks
+                ]
+                logger.info(f"Retrieved {len(rag_chunks)} chunks from vector DB")
+
+                # Extract doc_ids from chunks for referenced_documents
+                metadata_doc_ids = set()
+                for chunk in query_response.chunks[:5]:
+                    metadata = getattr(chunk, "metadata", None)
+                    if metadata and "doc_id" in metadata:
+                        reference_doc = metadata["doc_id"]
+                        logger.info(reference_doc)
+                        if reference_doc and reference_doc not in metadata_doc_ids:
+                            metadata_doc_ids.add(reference_doc)
+                            doc_ids_from_chunks.append(ReferencedDocument(
+                                    doc_id=reference_doc,
+                                    doc_title=metadata.get("title", None),
+                                    doc_url=metadata.get("url", None),
+
+                            )
+                        )
+                logger.info(
+                    f"Extracted {len(doc_ids_from_chunks)} unique document IDs from chunks"
+                )
+
+    except Exception as e:
+        logger.warning(f"Failed to query vector database for chunks: {e}")
+        logger.debug(f"Vector DB query error details: {traceback.format_exc()}")
+        # Continue without RAG chunks
 
     summary = TurnSummary(
         llm_response=(
@@ -805,9 +830,13 @@ async def retrieve_response(  # pylint: disable=too-many-locals,too-many-branche
             else ""
         ),
         tool_calls=[],
+        rag_chunks=rag_chunks,
     )
 
     referenced_documents = parse_referenced_documents(response)
+
+    # Add documents from Solr chunks to referenced_documents
+    referenced_documents.extend(doc_ids_from_chunks)
 
     # Update token count metrics and extract token usage in one call
     model_label = model_id.split("/", 1)[1] if "/" in model_id else model_id
