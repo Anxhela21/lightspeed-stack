@@ -182,16 +182,12 @@ class ReferencedDocument(BaseModel):
     Attributes:
         doc_url: Url to the referenced doc.
         doc_title: Title of the referenced doc.
-        doc_id: ID of the referenced doc.
     """
 
-    doc_url: Optional[AnyUrl] = Field(
-        None, description="URL of the referenced document"
+    doc_url: str | Optional[AnyUrl] = Field(None, description="URL of the referenced document"
     )
 
     doc_title: str | None = Field(None, description="Title of the referenced document")
-
-    doc_id: str | None = Field(None, description="ID of the referenced document")
 
 
 class QueryResponse(BaseModel):
