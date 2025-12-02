@@ -41,7 +41,6 @@ from models.requests import Attachment, QueryRequest
 from models.responses import (
     ForbiddenResponse,
     QueryResponse,
-    RAGChunk,
     ReferencedDocument,
     ToolCall,
     UnauthorizedResponse,
@@ -800,9 +799,7 @@ async def retrieve_response(  # pylint: disable=too-many-locals,too-many-branche
             logger.info(f"Final params being sent to vector_io.query: {params}")
 
             query_response = await client.vector_io.query(
-                vector_db_id=vector_db_id,
-                query=query_request.query,
-                params=params
+                vector_db_id=vector_db_id, query=query_request.query, params=params
             )
 
             logger.info(f"The query response total payload: {query_response}")
@@ -830,12 +827,13 @@ async def retrieve_response(  # pylint: disable=too-many-locals,too-many-branche
                         logger.info(reference_doc)
                         if reference_doc and reference_doc not in metadata_doc_ids:
                             metadata_doc_ids.add(reference_doc)
-                            doc_ids_from_chunks.append(ReferencedDocument(
+                            doc_ids_from_chunks.append(
+                                ReferencedDocument(
                                     doc_title=metadata.get("title", None),
-                                    doc_url="https://mimir.corp.redhat.com" + reference_doc
-
+                                    doc_url="https://mimir.corp.redhat.com"
+                                    + reference_doc,
+                                )
                             )
-                        )
                 # Store chunks and scores for later inclusion in TurnSummary
                 retrieved_chunks = query_response.chunks
                 retrieved_scores = (
