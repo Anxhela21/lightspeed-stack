@@ -758,21 +758,12 @@ async def retrieve_response(  # pylint: disable=too-many-locals,too-many-branche
         for doc in query_request.get_documents()
     ]
 
-    # Use the original query without adding RAG context to the user message
-    user_content = query_request.query
-
-    response = await agent.create_turn(
-        messages=[UserMessage(role="user", content=user_content)],
-        session_id=session_id,
-        documents=documents,
-        stream=False,
-        toolgroups=toolgroups,
-    )
-    response = cast(Turn, response)
-
-    # Extract RAG chunks from vector DB query response
+    # Extract RAG chunks from vector DB query response BEFORE calling agent
     rag_chunks = []
     doc_ids_from_chunks = []
+    retrieved_chunks = []
+    retrieved_scores = []
+    
     try:
         # Use the first available vector database if any exist
         vector_dbs = await client.vector_dbs.list()
@@ -807,16 +798,10 @@ async def retrieve_response(  # pylint: disable=too-many-locals,too-many-branche
             if query_response.chunks:
                 from models.responses import RAGChunk, ReferencedDocument
 
-                rag_chunks = [
-                    RAGChunk(
-                        content=str(chunk.content),  # Convert to string if needed
-                        source=getattr(chunk, "doc_id", None)
-                        or getattr(chunk, "source", None),
-                        score=getattr(chunk, "score", None),
-                    )
-                    for chunk in query_response.chunks[:5]  # Limit to top 5 chunks
-                ]
-                logger.info(f"Retrieved {len(rag_chunks)} chunks from vector DB")
+                retrieved_chunks = query_response.chunks
+                retrieved_scores = (
+                    query_response.scores if hasattr(query_response, "scores") else []
+                )
 
                 # Extract doc_ids from chunks for referenced_documents
                 metadata_doc_ids = set()
@@ -834,11 +819,6 @@ async def retrieve_response(  # pylint: disable=too-many-locals,too-many-branche
                                     + reference_doc,
                                 )
                             )
-                # Store chunks and scores for later inclusion in TurnSummary
-                retrieved_chunks = query_response.chunks
-                retrieved_scores = (
-                    query_response.scores if hasattr(query_response, "scores") else []
-                )
 
                 logger.info(
                     f"Extracted {len(doc_ids_from_chunks)} unique document IDs from chunks"
@@ -850,7 +830,6 @@ async def retrieve_response(  # pylint: disable=too-many-locals,too-many-branche
         # Continue without RAG chunks
 
     # Convert retrieved chunks to RAGChunk format
-    rag_chunks = []
     for i, chunk in enumerate(retrieved_chunks):
         # Extract source from chunk metadata based on OFFLINE flag
         source = None
@@ -873,29 +852,29 @@ async def retrieve_response(  # pylint: disable=too-many-locals,too-many-branche
             )
         )
 
-    # Convert retrieved chunks to RAGChunk format
-    rag_chunks = []
-    for i, chunk in enumerate(retrieved_chunks):
-        # Extract source from chunk metadata based on OFFLINE flag
-        source = None
-        if chunk.metadata:
-            if OFFLINE:
-                parent_id = chunk.metadata.get("parent_id")
-                if parent_id:
-                    source = urljoin("https://mimir.corp.redhat.com", parent_id)
-            else:
-                source = chunk.metadata.get("reference_url")
+    logger.info(f"Retrieved {len(rag_chunks)} chunks from vector DB")
 
-        # Get score from retrieved_scores list if available
-        score = retrieved_scores[i] if i < len(retrieved_scores) else None
+    # Format RAG context for injection into user message
+    rag_context = ""
+    if rag_chunks:
+        context_chunks = []
+        for chunk in rag_chunks[:5]:  # Limit to top 5 chunks
+            chunk_text = f"Source: {chunk.source or 'Unknown'}\n{chunk.content}"
+            context_chunks.append(chunk_text)
+        rag_context = "\n\nRelevant documentation:\n" + "\n\n".join(context_chunks)
+        logger.info(f"Injecting {len(context_chunks)} RAG chunks into user message")
 
-        rag_chunks.append(
-            RAGChunk(
-                content=chunk.content,
-                source=source,
-                score=score,
-            )
-        )
+    # Inject RAG context into user message
+    user_content = query_request.query + rag_context
+
+    response = await agent.create_turn(
+        messages=[UserMessage(role="user", content=user_content)],
+        session_id=session_id,
+        documents=documents,
+        stream=False,
+        toolgroups=toolgroups,
+    )
+    response = cast(Turn, response)
 
     summary = TurnSummary(
         llm_response=(

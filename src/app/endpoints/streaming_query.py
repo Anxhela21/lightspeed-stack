@@ -1210,8 +1210,86 @@ async def retrieve_response(
         for doc in query_request.get_documents()
     ]
 
+    # Get RAG chunks before sending to LLM (reuse logic from query_vector_io_for_chunks)
+    rag_chunks = []
+    try:
+        # Use the first available vector database if any exist
+        vector_dbs = await client.vector_dbs.list()
+        vector_db_ids = [vdb.identifier for vdb in vector_dbs]
+
+        if vector_db_ids:
+            vector_db_id = vector_db_ids[0]  # Use first available vector DB
+
+            params = {"k": 5, "score_threshold": 0.0}
+            logger.info("Initial params: %s", params)
+            logger.info("query_request.solr: %s", query_request.solr)
+            if query_request.solr and "fq" in query_request.solr:
+                # fq parameter can be dict or string
+                fq_value = query_request.solr["fq"]
+                logger.info("fq_value: %s, type: %s", fq_value, type(fq_value))
+                if isinstance(fq_value, dict):
+                    # convert dict to solr filter format: key:value
+                    params["fq"] = [f"{key}:{value}" for key, value in fq_value.items()]
+                else:
+                    params["fq"] = fq_value
+                logger.info("Final params with solr filters: %s", params)
+            else:
+                logger.info("No solr filters provided or 'fq' key not found")
+            logger.info("Final params being sent to vector_io.query: %s", params)
+
+            query_response = await client.vector_io.query(
+                vector_db_id=vector_db_id, query=query_request.query, params=params
+            )
+
+            logger.info("The query response total payload: %s", query_response)
+
+            if query_response.chunks:
+                # Convert retrieved chunks to RAGChunk format with proper source handling
+                for chunk in query_response.chunks[:5]:
+                    # Extract source from chunk metadata based on OFFLINE flag
+                    source = None
+                    if chunk.metadata:
+                        if OFFLINE:
+                            parent_id = chunk.metadata.get("parent_id")
+                            if parent_id:
+                                source = urljoin(
+                                    "https://mimir.corp.redhat.com", parent_id
+                                )
+                        else:
+                            source = chunk.metadata.get("reference_url")
+
+                    # Get score from chunk if available
+                    score = getattr(chunk, "score", None)
+
+                    rag_chunks.append(
+                        RAGChunk(
+                            content=chunk.content,
+                            source=source,
+                            score=score,
+                        )
+                    )
+
+                logger.info("Retrieved %d chunks from vector DB for streaming", len(rag_chunks))
+
+    except Exception as e:
+        logger.warning("Failed to query vector database for chunks: %s", e)
+        logger.debug("Vector DB query error details: %s", traceback.format_exc())
+
+    # Format RAG context for injection into user message
+    rag_context = ""
+    if rag_chunks:
+        context_chunks = []
+        for chunk in rag_chunks[:5]:  # Limit to top 5 chunks
+            chunk_text = f"Source: {chunk.source or 'Unknown'}\n{chunk.content}"
+            context_chunks.append(chunk_text)
+        rag_context = "\n\nRelevant documentation:\n" + "\n\n".join(context_chunks)
+        logger.info("Injecting %d RAG chunks into streaming user message", len(context_chunks))
+
+    # Inject RAG context into user message
+    user_content = query_request.query + rag_context
+
     response = await agent.create_turn(
-        messages=[UserMessage(role="user", content=query_request.query)],
+        messages=[UserMessage(role="user", content=user_content)],
         session_id=session_id,
         documents=documents,
         stream=True,
