@@ -492,35 +492,26 @@ def _handle_shield_event(
     Processes a shield event chunk and yields a formatted SSE token
     event indicating shield validation results.
 
-    Yields a "No Violation" token if no violation is detected, or a
-    violation message if a shield violation occurs. Increments
-    validation error metrics when violations are present.
+    Only yields events when violations are detected. Successful
+    shield validations (no violations) are silently ignored.
     """
     if chunk.event.payload.event_type == "step_complete":
         violation = chunk.event.payload.step_details.violation
-        if not violation:
-            yield stream_event(
-                data={
-                    "id": chunk_id,
-                    "token": "No Violation",
-                },
-                event_type=LLM_TOKEN_EVENT,
-                media_type=media_type,
-            )
-        else:
+        if violation:
             # Metric for LLM validation errors
             metrics.llm_calls_validation_errors_total.inc()
-            violation = (
+            violation_msg = (
                 f"Violation: {violation.user_message} (Metadata: {violation.metadata})"
             )
             yield stream_event(
                 data={
                     "id": chunk_id,
-                    "token": violation,
+                    "token": violation_msg,
                 },
                 event_type=LLM_TOKEN_EVENT,
                 media_type=media_type,
             )
+        # Skip yielding anything for sucessful shield validations
 
 
 # -----------------------------------
