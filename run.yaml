@@ -16,7 +16,7 @@ apis:
 benchmarks: []
 container_image: null
 datasets: []
-external_providers_dir: /Users/acoba/Documents/github/lightspeed/lightspeed-providers/resources/external_providers
+external_providers_dir: ${env.EXTERNAL_PROVIDERS_DIR}
 inference_store:
   db_path: .llama/distributions/ollama/inference_store.db
   type: sqlite
@@ -128,18 +128,6 @@ providers:
           type: sqlite
           db_path: .llama/distributions/ollama/portal_rag_kvstore.db
           namespace: portal-rag
-        chunk_window_config:
-          chunk_parent_id_field: "parent_id"
-          chunk_index_field: "chunk_index"
-          chunk_token_count_field: "num_tokens"
-          chunk_content_field: "chunk"
-          parent_total_chunks_field: "total_chunks"
-          parent_total_tokens_field: "total_tokens"
-          parent_content_id_field: "doc_id"
-          parent_content_title_field: "title"
-          parent_content_url_field: "reference_url"
-          chunk_filter_query: "is_chunk:true"
-
 scoring_fns: []
 server:
   auth: null
@@ -160,18 +148,10 @@ vector_dbs:
     embedding_model: granite-embedding
     embedding_dimension: 384
 models:
-  - model_id: dummy-embedder
-    model_type: embedding
-    provider_id: sentence-transformers
-    provider_model_id: all-MiniLM-L6-v2
-    metadata:
-      embedding_dimension: 384
-
   - model_id: gpt-4-turbo
     model_type: llm
     provider_id: openai
     provider_model_id: gpt-4-turbo
-
   - model_id: granite-embedding
     model_type: embedding
     provider_id: sentence-transformers

@@ -742,7 +742,7 @@ async def retrieve_response(  # pylint: disable=too-many-locals,too-many-branche
             ),
         }
 
-        # Skip RAG toolgroups since we'll query Solr directly
+        # Skip RAG toolgroups since we query Solr directly
         toolgroups = [mcp_server.name for mcp_server in configuration.mcp_servers]
         # Convert empty list to None for consistency with existing behavior
         if not toolgroups:
