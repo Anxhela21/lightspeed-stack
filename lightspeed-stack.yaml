@@ -8,12 +8,12 @@ service:
   access_log: true
 llama_stack:
   # Uses llama-stack as a library
-  use_as_library_client: true
-  library_client_config_path: run.yaml
+  use_as_library_client: false
+  # library_client_config_path: run.yaml
   # Remote service configuration (disabled)
   # use_as_library_client: false
-  # url: http://llama-stack:8321
-  # api_key: xyzzy
+  url: http://llama-stack:8321
+  api_key: xyzzy
 user_data_collection:
   feedback_enabled: true
   feedback_storage: "/tmp/data/feedback"
