@@ -162,7 +162,7 @@ class QueryRequest(BaseModel):
 
     # provides examples for /docs endpoint
     model_config = {
-        # "extra": "forbid",
+        "extra": "forbid",
         "json_schema_extra": {
             "examples": [
                 {
