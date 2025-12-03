@@ -156,8 +156,7 @@ class QueryRequest(BaseModel):
         None,
         description="Solr-specific query parameters including filter queries",
         examples=[
-            {"fq": {"product": "openshift", "product_version": "4.16"}},
-            {"fq": "product:openshift AND product_version:4.16"},
+            {"fq": {"product:*openshift*", "product_version:*4.16*"}},
         ],
     )
 

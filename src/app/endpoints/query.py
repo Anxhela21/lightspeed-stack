@@ -775,18 +775,12 @@ async def retrieve_response(  # pylint: disable=too-many-locals,too-many-branche
             params = {"k": 5, "score_threshold": 0.0}
             logger.info(f"Initial params: {params}")
             logger.info(f"query_request.solr: {query_request.solr}")
-            if query_request.solr and "fq" in query_request.solr:
-                # fq parameter can be dict or string
-                fq_value = query_request.solr["fq"]
-                logger.info(f"fq_value: {fq_value}, type: {type(fq_value)}")
-                if isinstance(fq_value, dict):
-                    # convert dict to solr filter format: key:value
-                    params["fq"] = [f"{key}:{value}" for key, value in fq_value.items()]
-                else:
-                    params["fq"] = fq_value
+            if query_request.solr:
+                # Pass the entire solr dict under the 'solr' key
+                params["solr"] = query_request.solr
                 logger.info(f"Final params with solr filters: {params}")
             else:
-                logger.info("No solr filters provided or 'fq' key not found")
+                logger.info("No solr filters provided")
             logger.info(f"Final params being sent to vector_io.query: {params}")
 
             query_response = await client.vector_io.query(
