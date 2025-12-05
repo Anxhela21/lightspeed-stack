@@ -27,6 +27,7 @@ from llama_stack_client.types.agents.turn_create_params import Document
 
 from app.database import get_session
 from app.endpoints.query import (
+    get_rag_toolgroups,
     is_input_shield,
     is_output_shield,
     is_transcripts_enabled,
@@ -1179,10 +1180,19 @@ async def retrieve_response(
             ),
         }
 
-        # Skip RAG toolgroups since we'll query Solr directly
-        toolgroups = [mcp_server.name for mcp_server in configuration.mcp_servers]
+        # Include RAG toolgroups when vector DBs are available
+        vector_dbs = await client.vector_dbs.list()
+        vector_db_ids = [vdb.identifier for vdb in vector_dbs]
+        mcp_toolgroups = [mcp_server.name for mcp_server in configuration.mcp_servers]
+
+        toolgroups = None
+        if vector_db_ids:
+            toolgroups = get_rag_toolgroups(vector_db_ids) + mcp_toolgroups
+        elif mcp_toolgroups:
+            toolgroups = mcp_toolgroups
+
         # Convert empty list to None for consistency with existing behavior
-        if not toolgroups:
+        if toolgroups == []:
             toolgroups = None
 
     # TODO: LCORE-881 - Remove if Llama Stack starts to support these mime types
@@ -1198,10 +1208,6 @@ async def retrieve_response(
     # Get RAG chunks before sending to LLM (reuse logic from query_vector_io_for_chunks)
     rag_chunks = []
     try:
-        # Use the first available vector database if any exist
-        vector_dbs = await client.vector_dbs.list()
-        vector_db_ids = [vdb.identifier for vdb in vector_dbs]
-
         if vector_db_ids:
             vector_db_id = vector_db_ids[0]  # Use first available vector DB
 
@@ -1248,7 +1254,9 @@ async def retrieve_response(
                         )
                     )
 
-                logger.info("Retrieved %d chunks from vector DB for streaming", len(rag_chunks))
+                logger.info(
+                    "Retrieved %d chunks from vector DB for streaming", len(rag_chunks)
+                )
 
     except Exception as e:
         logger.warning("Failed to query vector database for chunks: %s", e)
@@ -1262,7 +1270,9 @@ async def retrieve_response(
             chunk_text = f"Source: {chunk.source or 'Unknown'}\n{chunk.content}"
             context_chunks.append(chunk_text)
         rag_context = "\n\nRelevant documentation:\n" + "\n\n".join(context_chunks)
-        logger.info("Injecting %d RAG chunks into streaming user message", len(context_chunks))
+        logger.info(
+            "Injecting %d RAG chunks into streaming user message", len(context_chunks)
+        )
 
     # Inject RAG context into user message
     user_content = query_request.query + rag_context

@@ -742,10 +742,19 @@ async def retrieve_response(  # pylint: disable=too-many-locals,too-many-branche
             ),
         }
 
-        # Skip RAG toolgroups since we query Solr directly
-        toolgroups = [mcp_server.name for mcp_server in configuration.mcp_servers]
+        # Include RAG toolgroups when vector DBs are available
+        vector_dbs = await client.vector_dbs.list()
+        vector_db_ids = [vdb.identifier for vdb in vector_dbs]
+        mcp_toolgroups = [mcp_server.name for mcp_server in configuration.mcp_servers]
+
+        toolgroups = None
+        if vector_db_ids:
+            toolgroups = get_rag_toolgroups(vector_db_ids) + mcp_toolgroups
+        elif mcp_toolgroups:
+            toolgroups = mcp_toolgroups
+
         # Convert empty list to None for consistency with existing behavior
-        if not toolgroups:
+        if toolgroups == []:
             toolgroups = None
 
     # TODO: LCORE-881 - Remove if Llama Stack starts to support these mime types
@@ -763,12 +772,8 @@ async def retrieve_response(  # pylint: disable=too-many-locals,too-many-branche
     doc_ids_from_chunks = []
     retrieved_chunks = []
     retrieved_scores = []
-    
-    try:
-        # Use the first available vector database if any exist
-        vector_dbs = await client.vector_dbs.list()
-        vector_db_ids = [vdb.identifier for vdb in vector_dbs]
 
+    try:
         if vector_db_ids:
             vector_db_id = vector_db_ids[0]  # Use first available vector DB
 
