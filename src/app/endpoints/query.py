@@ -4,25 +4,31 @@ import ast
 import json
 import logging
 import re
+import traceback
 from datetime import UTC, datetime
 from typing import Annotated, Any, Optional, cast
+from urllib.parse import urljoin
 
 from fastapi import APIRouter, Depends, HTTPException, Request
+from litellm.exceptions import RateLimitError
+from pydantic import ValidationError
 from llama_stack_client import (
     APIConnectionError,
     APIStatusError,
     AsyncLlamaStackClient,
-    RateLimitError,  # type: ignore
+    RateLimitError as LlamaStackRateLimitError,  # type: ignore
 )
+from llama_stack_client.lib.agents.event_logger import interleaved_content_as_str
 from llama_stack_client.types import Shield, UserMessage  # type: ignore
-from llama_stack_client.types.alpha.agents.turn import Turn
-from llama_stack_client.types.alpha.agents.turn_create_params import (
+from llama_stack_client.types.agents.turn import Turn
+from llama_stack_client.types.agents.turn_create_params import (
+    Document,
     Toolgroup,
     ToolgroupAgentToolGroupWithArgs,
 )
 from llama_stack_client.types.model_list_response import ModelListResponse
 from llama_stack_client.types.shared.interleaved_content_item import TextContentItem
-from llama_stack_client.types.alpha.tool_execution_step import ToolExecutionStep
+from llama_stack_client.types.tool_execution_step import ToolExecutionStep
 from sqlalchemy.exc import SQLAlchemyError
 
 import constants
@@ -42,10 +48,10 @@ from models.responses import (
     InternalServerErrorResponse,
     NotFoundResponse,
     QueryResponse,
-    PromptTooLongResponse,
     QuotaExceededResponse,
     ReferencedDocument,
     ServiceUnavailableResponse,
+    ToolCall,
     UnauthorizedResponse,
     UnprocessableEntityResponse,
 )
@@ -68,11 +74,15 @@ from utils.quota import (
 from utils.suid import normalize_conversation_id
 from utils.token_counter import TokenCounter, extract_and_update_token_metrics
 from utils.transcripts import store_transcript
-from utils.types import TurnSummary, content_to_str
+from utils.types import TurnSummary
 
 logger = logging.getLogger("app.endpoints.handlers")
 router = APIRouter(tags=["query"])
 
+# When OFFLINE is False, use reference_url for chunk source
+# When OFFLINE is True, use parent_id for chunk source
+# TODO: move this setting to a higher level configuration
+OFFLINE = True
 
 query_response: dict[int | str, dict[str, Any]] = {
     200: QueryResponse.openapi_response(),
@@ -85,7 +95,6 @@ query_response: dict[int | str, dict[str, Any]] = {
     404: NotFoundResponse.openapi_response(
         examples=["model", "conversation", "provider"]
     ),
-    413: PromptTooLongResponse.openapi_response(),
     422: UnprocessableEntityResponse.openapi_response(),
     429: QuotaExceededResponse.openapi_response(),
     500: InternalServerErrorResponse.openapi_response(examples=["configuration"]),
@@ -214,14 +223,14 @@ async def get_topic_summary(
         client, model_id, topic_summary_system_prompt
     )
     response = await agent.create_turn(
-        messages=[UserMessage(role="user", content=question).model_dump()],
+        messages=[UserMessage(role="user", content=question)],
         session_id=session_id,
         stream=False,
-        # toolgroups=None,
+        toolgroups=None,
     )
     response = cast(Turn, response)
     return (
-        content_to_str(response.output_message.content)
+        interleaved_content_as_str(response.output_message.content)
         if (
             getattr(response, "output_message", None) is not None
             and getattr(response.output_message, "content", None) is not None
@@ -312,15 +321,18 @@ async def query_endpoint_handler_base(  # pylint: disable=R0914
                 user_conversation=user_conversation, query_request=query_request
             ),
         )
-        summary, conversation_id, referenced_documents, token_usage = (
-            await retrieve_response_func(
-                client,
-                llama_stack_model_id,
-                query_request,
-                token,
-                mcp_headers=mcp_headers,
-                provider_id=provider_id,
-            )
+        (
+            summary,
+            conversation_id,
+            referenced_documents,
+            token_usage,
+        ) = await retrieve_response_func(
+            client,
+            llama_stack_model_id,
+            query_request,
+            token,
+            mcp_headers=mcp_headers,
+            provider_id=provider_id,
         )
 
         # Get the initial topic summary for the conversation
@@ -406,6 +418,20 @@ async def query_endpoint_handler_base(  # pylint: disable=R0914
 
         # Convert tool calls to response format
         logger.info("Processing tool calls...")
+        tool_calls = [
+            ToolCall(
+                tool_name=tc.name,
+                arguments=(
+                    tc.args if isinstance(tc.args, dict) else {"query": str(tc.args)}
+                ),
+                result=(
+                    {"response": tc.response}
+                    if tc.response and tc.name != constants.DEFAULT_RAG_TOOL
+                    else None
+                ),
+            )
+            for tc in summary.tool_calls
+        ]
 
         logger.info("Using referenced documents from response...")
 
@@ -415,8 +441,8 @@ async def query_endpoint_handler_base(  # pylint: disable=R0914
         response = QueryResponse(
             conversation_id=conversation_id,
             response=summary.llm_response,
-            tool_calls=summary.tool_calls if summary.tool_calls else None,
-            tool_results=summary.tool_results if summary.tool_results else None,
+            rag_chunks=summary.rag_chunks if summary.rag_chunks else [],
+            tool_calls=tool_calls if tool_calls else None,
             referenced_documents=referenced_documents,
             truncated=False,  # TODO: implement truncation detection
             input_tokens=token_usage.input_tokens,
@@ -437,21 +463,12 @@ async def query_endpoint_handler_base(  # pylint: disable=R0914
         )
         raise HTTPException(**response.model_dump()) from e
     except SQLAlchemyError as e:
-        logger.exception("Error persisting conversation details.")
+        logger.exception("Error persisting conversation details: %s", e)
         response = InternalServerErrorResponse.database_error()
         raise HTTPException(**response.model_dump()) from e
-    except RateLimitError as e:
+    except (RateLimitError, LlamaStackRateLimitError) as e:
         used_model = getattr(e, "model", "")
-        if used_model:
-            response = QuotaExceededResponse.model(used_model)
-        else:
-            response = QuotaExceededResponse(
-                response="The quota has been exceeded", cause=str(e)
-            )
-        raise HTTPException(**response.model_dump()) from e
-    except APIStatusError as e:
-        logger.exception("Error in query endpoint handler: %s", e)
-        response = InternalServerErrorResponse.generic()
+        response = QuotaExceededResponse.model(used_model)
         raise HTTPException(**response.model_dump()) from e
 
 
@@ -758,39 +775,148 @@ async def retrieve_response(  # pylint: disable=too-many-locals,too-many-branche
         if query_request.vector_store_ids:
             vector_db_ids = query_request.vector_store_ids
         else:
-            vector_db_ids = [
-                vector_store.id
-                for vector_store in (await client.vector_stores.list()).data
-            ]
-        toolgroups = (get_rag_toolgroups(vector_db_ids) or []) + [
-            mcp_server.name for mcp_server in configuration.mcp_servers
-        ]
+            try:
+                # Try vector_stores first (new API)
+                vector_stores = await client.vector_stores.list()
+                vector_db_ids = [vs.id for vs in vector_stores.data]
+            except AttributeError:
+                # Fallback to vector_dbs (old API)
+                vector_dbs = await client.vector_dbs.list()
+                vector_db_ids = [vdb.identifier for vdb in vector_dbs]
+        
+        mcp_toolgroups = [mcp_server.name for mcp_server in configuration.mcp_servers]
+
+        toolgroups = None
+        if vector_db_ids:
+            toolgroups = get_rag_toolgroups(vector_db_ids) + mcp_toolgroups
+        elif mcp_toolgroups:
+            toolgroups = mcp_toolgroups
         # Convert empty list to None for consistency with existing behavior
-        if not toolgroups:
+        if toolgroups == []:
             toolgroups = None
 
     # TODO: LCORE-881 - Remove if Llama Stack starts to support these mime types
-    # documents: list[Document] = [
-    #     (
-    #         {"content": doc["content"], "mime_type": "text/plain"}
-    #         if doc["mime_type"].lower() in ("application/json", "application/xml")
-    #         else doc
-    #     )
-    #     for doc in query_request.get_documents()
-    # ]
+    documents: list[Document] = [
+        (
+            {"content": doc["content"], "mime_type": "text/plain"}
+            if doc["mime_type"].lower() in ("application/json", "application/xml")
+            else doc
+        )
+        for doc in query_request.get_documents()
+    ]
+
+    # Extract RAG chunks from vector DB query response BEFORE calling agent
+    rag_chunks = []
+    doc_ids_from_chunks = []
+    retrieved_chunks = []
+    retrieved_scores = []
+
+    try:
+        if vector_db_ids:
+            vector_db_id = vector_db_ids[0]  # Use first available vector DB
+
+            params = {"k": 5, "score_threshold": 0.0}
+            logger.info("Initial params: %s", params)
+            logger.info("query_request.solr: %s", query_request.solr)
+            if query_request.solr:
+                # Pass the entire solr dict under the 'solr' key
+                params["solr"] = query_request.solr
+                logger.info("Final params with solr filters: %s", params)
+            else:
+                logger.info("No solr filters provided")
+            logger.info("Final params being sent to vector_io.query: %s", params)
+
+            query_response = await client.vector_io.query(
+                vector_db_id=vector_db_id, query=query_request.query, params=params
+            )
+
+            logger.info("The query response total payload: %s", query_response)
+
+            if query_response.chunks:
+                from models.responses import RAGChunk, ReferencedDocument
+
+                retrieved_chunks = query_response.chunks
+                retrieved_scores = (
+                    query_response.scores if hasattr(query_response, "scores") else []
+                )
+
+                # Extract doc_ids from chunks for referenced_documents
+                metadata_doc_ids = set()
+                for chunk in query_response.chunks:
+                    metadata = getattr(chunk, "metadata", None)
+                    if metadata and "doc_id" in metadata:
+                        reference_doc = metadata["doc_id"]
+                        logger.info(reference_doc)
+                        if reference_doc and reference_doc not in metadata_doc_ids:
+                            metadata_doc_ids.add(reference_doc)
+                            doc_ids_from_chunks.append(
+                                ReferencedDocument(
+                                    doc_title=metadata.get("title", None),
+                                    doc_url="https://mimir.corp.redhat.com"
+                                    + reference_doc,
+                                )
+                            )
+
+                logger.info(
+                    "Extracted %d unique document IDs from chunks",
+                    len(doc_ids_from_chunks),
+                )
+
+    except Exception as e:
+        logger.warning("Failed to query vector database for chunks: %s", e)
+        logger.debug("Vector DB query error details: %s", traceback.format_exc())
+        # Continue without RAG chunks
+
+    # Convert retrieved chunks to RAGChunk format
+    for i, chunk in enumerate(retrieved_chunks):
+        # Extract source from chunk metadata based on OFFLINE flag
+        source = None
+        if chunk.metadata:
+            if OFFLINE:
+                parent_id = chunk.metadata.get("parent_id")
+                if parent_id:
+                    source = urljoin("https://mimir.corp.redhat.com", parent_id)
+            else:
+                source = chunk.metadata.get("reference_url")
+
+        # Get score from retrieved_scores list if available
+        score = retrieved_scores[i] if i < len(retrieved_scores) else None
+
+        rag_chunks.append(
+            RAGChunk(
+                content=chunk.content,
+                source=source,
+                score=score,
+            )
+        )
+
+    logger.info("Retrieved %d chunks from vector DB", len(rag_chunks))
+
+    # Format RAG context for injection into user message
+    rag_context = ""
+    if rag_chunks:
+        context_chunks = []
+        for chunk in rag_chunks[:5]:  # Limit to top 5 chunks
+            chunk_text = f"Source: {chunk.source or 'Unknown'}\n{chunk.content}"
+            context_chunks.append(chunk_text)
+        rag_context = "\n\nRelevant documentation:\n" + "\n\n".join(context_chunks)
+        logger.info("Injecting %d RAG chunks into user message", len(context_chunks))
+
+    # Inject RAG context into user message
+    user_content = query_request.query + rag_context
 
     response = await agent.create_turn(
-        messages=[UserMessage(role="user", content=query_request.query).model_dump()],
+        messages=[UserMessage(role="user", content=user_content)],
         session_id=session_id,
-        # documents=documents,
+        documents=documents,
         stream=False,
-        # toolgroups=toolgroups,
+        toolgroups=toolgroups,
     )
     response = cast(Turn, response)
 
     summary = TurnSummary(
         llm_response=(
-            content_to_str(response.output_message.content)
+            interleaved_content_as_str(response.output_message.content)
             if (
                 getattr(response, "output_message", None) is not None
                 and getattr(response.output_message, "content", None) is not None
@@ -798,11 +924,13 @@ async def retrieve_response(  # pylint: disable=too-many-locals,too-many-branche
             else ""
         ),
         tool_calls=[],
-        tool_results=[],
-        rag_chunks=[],
+        rag_chunks=rag_chunks,
     )
 
     referenced_documents = parse_referenced_documents(response)
+
+    # Add documents from Solr chunks to referenced_documents
+    referenced_documents.extend(doc_ids_from_chunks)
 
     # Update token count metrics and extract token usage in one call
     model_label = model_id.split("/", 1)[1] if "/" in model_id else model_id

@@ -447,7 +447,28 @@ def test_insert_and_get_with_referenced_documents(tmpdir: Path) -> None:
 
     # Assert that the retrieved entry matches the original
     assert len(retrieved_entries) == 1
-    assert retrieved_entries[0] == entry_with_docs
+    retrieved_entry = retrieved_entries[0]
+    # Check all fields match
+    assert retrieved_entry.query == entry_with_docs.query
+    assert retrieved_entry.response == entry_with_docs.response
+    assert retrieved_entry.provider == entry_with_docs.provider
+    assert retrieved_entry.model == entry_with_docs.model
+    assert retrieved_entry.started_at == entry_with_docs.started_at
+    assert retrieved_entry.completed_at == entry_with_docs.completed_at
+    # Check referenced documents - URLs may be strings after serialization
+    assert retrieved_entry.referenced_documents is not None
+    assert entry_with_docs.referenced_documents is not None
+    assert len(retrieved_entry.referenced_documents) == len(entry_with_docs.referenced_documents)
+    # pylint: disable-next=unsubscriptable-object
+    assert (
+        str(retrieved_entry.referenced_documents[0].doc_url)
+        == str(entry_with_docs.referenced_documents[0].doc_url)  # pylint: disable=unsubscriptable-object
+    )
+    # pylint: disable-next=unsubscriptable-object
+    assert (
+        retrieved_entry.referenced_documents[0].doc_title
+        == entry_with_docs.referenced_documents[0].doc_title  # pylint: disable=unsubscriptable-object
+    )
     assert retrieved_entries[0].referenced_documents is not None
     assert retrieved_entries[0].referenced_documents[0].doc_title == "Test Doc"
 

@@ -10,15 +10,7 @@ logger = get_logger(__name__)
 
 
 def start_uvicorn(configuration: ServiceConfiguration) -> None:
-    """
-    Start the Uvicorn server using the provided service configuration.
-
-    Parameters:
-        configuration (ServiceConfiguration): Configuration providing host,
-        port, workers, and `tls_config` (including `tls_key_path`,
-        `tls_certificate_path`, and `tls_key_password`). TLS fields may be None
-        and will be forwarded to uvicorn.run as provided.
-    """
+    """Start Uvicorn-based REST API service."""
     logger.info("Starting Uvicorn")
 
     log_level = logging.INFO

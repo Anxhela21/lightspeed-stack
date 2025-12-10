@@ -10,13 +10,16 @@ jobs:
       fail-fast: false
       matrix:
         mode: ["server", "library"]
-        environment: ["ci"]
+        environment: ["ci", "azure"]
     
     name: "E2E: ${{ matrix.mode }} mode / ${{ matrix.environment }}"
     
     env:
       OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
       E2E_OPENAI_MODEL: ${{ vars.E2E_OPENAI_MODEL }}
+      CLIENT_SECRET: ${{ secrets.CLIENT_SECRET }}
+      CLIENT_ID: ${{ secrets.CLIENT_ID }}
+      TENANT_ID: ${{ secrets.TENANT_ID }}
       E2E_DEPLOYMENT_MODE: ${{ matrix.mode }}
 
     steps:
@@ -49,7 +52,8 @@ jobs:
       - name: Load lightspeed-stack.yaml configuration
         run: |
           MODE="${{ matrix.mode }}"
-          CONFIG_FILE="tests/e2e/configuration/${MODE}-mode/lightspeed-stack.yaml"
+          CONFIG_FILE="tests/e2e/configuration/lightspeed-stack-${MODE}-mode.yaml"
+          
           echo "Loading configuration for ${MODE} mode"
           echo "Source: ${CONFIG_FILE}"
           
@@ -61,9 +65,35 @@ jobs:
           cp "${CONFIG_FILE}" lightspeed-stack.yaml
           echo "✅ Configuration loaded successfully"
         
+      - name: Get Azure API key (access token)
+        if: matrix.environment == 'azure'
+        id: azure_token
+        env:
+          CLIENT_ID: ${{ secrets.CLIENT_ID }}
+          CLIENT_SECRET: ${{ secrets.CLIENT_SECRET }}
+          TENANT_ID: ${{ secrets.TENANT_ID }}
+        run: |
+          echo "Requesting Azure API token..."
+          RESPONSE=$(curl -s -X POST \
+            -H "Content-Type: application/x-www-form-urlencoded" \
+            -d "client_id=$CLIENT_ID&scope=https://cognitiveservices.azure.com/.default&client_secret=$CLIENT_SECRET&grant_type=client_credentials" \
+            "https://login.microsoftonline.com/$TENANT_ID/oauth2/v2.0/token")
+
+          echo "Response received. Extracting access_token..."
+          ACCESS_TOKEN=$(echo "$RESPONSE" | jq -r '.access_token')
+
+          if [ -z "$ACCESS_TOKEN" ] || [ "$ACCESS_TOKEN" == "null" ]; then
+            echo "❌ Failed to obtain Azure access token. Response:"
+            echo "$RESPONSE"
+            exit 1
+          fi
+
+          echo "✅ Successfully obtained Azure access token."
+          echo "AZURE_API_KEY=$ACCESS_TOKEN" >> $GITHUB_ENV
+
       - name: Select and configure run.yaml
         env:
-          CONFIG_ENVIRONMENT: ${{ matrix.environment || 'ci' }}
+          CONFIG_ENVIRONMENT: ${{ matrix.environment }}
         run: |
           CONFIGS_DIR="tests/e2e/configs"
           ENVIRONMENT="$CONFIG_ENVIRONMENT"
@@ -85,22 +115,29 @@ jobs:
           echo "Looking for: $CONFIG_FILE"
           
           if [ -f "$CONFIG_FILE" ]; then
-            echo "✅ Found config for environment: $ENVIRONMENT"
+            echo "Found config for $ENVIRONMENT environment"
             cp "$CONFIG_FILE" run.yaml
-            echo "✅ Config copied to run.yaml"
           else
-            echo "❌ Configuration file not found: $CONFIG_FILE"
-            echo "Available files in $CONFIGS_DIR:"
-            ls -la "$CONFIGS_DIR/"
+            echo "Configuration file not found: $CONFIG_FILE"
+            echo "Available files:"
+            find "$CONFIGS_DIR" -name "*.yaml"
             exit 1
           fi
+          
+          # Update paths for container environment (relative -> absolute)
+          sed -i 's|db_path: \.llama/distributions|db_path: /app-root/.llama/distributions|g' run.yaml
+          sed -i 's|db_path: tmp/|db_path: /app-root/.llama/distributions/|g' run.yaml
+                    
+          echo "Successfully configured for $ENVIRONMENT environment"
+          echo "Using configuration: $(basename "$CONFIG_FILE")"
 
       - name: Show final configuration
         run: |
           echo "=== Configuration Summary ==="
           echo "Deployment mode: ${{ matrix.mode }}"
           echo "Environment: ${{ matrix.environment }}"
-          echo "Source config: tests/e2e/configs/run-ci.yaml"
+          echo "Source config: tests/e2e/configs/run-${{ matrix.environment }}.yaml"
+          echo "Final file: run.yaml"
           echo ""
           echo "=== Configuration Preview ==="
           echo "Providers: $(grep -c "provider_id:" run.yaml)"
@@ -109,32 +146,19 @@ jobs:
           echo "=== lightspeed-stack.yaml ==="
           grep -A 3 "llama_stack:" lightspeed-stack.yaml
 
-      - name: Docker Login for quay access
-        env:
-          QUAY_ROBOT_USERNAME: ${{ secrets.QUAY_DOWNSTREAM_USERNAME }}
-          QUAY_ROBOT_TOKEN: ${{ secrets.QUAY_DOWNSTREAM_TOKEN }}
-        run: |
-          echo $QUAY_ROBOT_TOKEN | docker login quay.io -u=$QUAY_ROBOT_USERNAME --password-stdin
-
-      - name: Create dummy GCP keys directory
-        if: matrix.environment != 'vertexai'
-        run: |
-          echo "Creating dummy GCP keys directory for non-VertexAI environment..."
-          mkdir -p ./tmp/.gcp-keys-dummy
-          echo "✅ Dummy directory created."
-
       - name: Run services (Server Mode)
         if: matrix.mode == 'server'
-        env:
+        env: 
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          AZURE_API_KEY: ${{ env.AZURE_API_KEY }}
         run: |
           # Debug: Check if environment variable is available for docker-compose
           echo "OPENAI_API_KEY is set: $([ -n "$OPENAI_API_KEY" ] && echo 'YES' || echo 'NO')"
           echo "OPENAI_API_KEY length: ${#OPENAI_API_KEY}"
-
+          
           docker compose version
           docker compose up -d
-
+          
           # Check for errors and show logs if any services failed
           if docker compose ps | grep -E 'Exit|exited|stopped'; then
             echo "Some services failed to start - showing logs:"
@@ -148,10 +172,11 @@ jobs:
         if: matrix.mode == 'library'
         env: 
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          AZURE_API_KEY: ${{ env.AZURE_API_KEY }}
         run: |
           echo "Starting service in library mode (1 container)"
           docker compose -f docker-compose-library.yaml up -d
-
+          
           if docker compose -f docker-compose-library.yaml ps | grep -E 'Exit|exited|stopped'; then
             echo "Service failed to start - showing logs:"
             docker compose -f docker-compose-library.yaml logs

@@ -79,6 +79,16 @@ def directory_check(
     if not os.path.exists(path):
         if must_exists:
             raise InvalidConfigurationError(f"{desc} '{path}' does not exist")
+        # If directory doesn't exist but we need it to be writable,
+        # check if we can create it by checking parent directory writability
+        if must_be_writable:
+            parent_path = os.path.dirname(path)
+            if not os.path.exists(parent_path):
+                raise InvalidConfigurationError(
+                    f"{desc} '{path}' cannot be created - parent directory does not exist"
+                )
+            if not os.access(parent_path, os.W_OK):
+                raise InvalidConfigurationError(f"{desc} '{path}' is not writable")
         return
     if not os.path.isdir(path):
         raise InvalidConfigurationError(f"{desc} '{path}' is not a directory")
@@ -87,7 +97,7 @@ def directory_check(
             raise InvalidConfigurationError(f"{desc} '{path}' is not writable")
 
 
-def import_python_module(profile_name: str, profile_path: str) -> Optional[ModuleType]:
+def import_python_module(profile_name: str, profile_path: str) -> ModuleType | None:
     """
     Import a Python module from a filesystem path and return the loaded module.
 
@@ -96,7 +106,7 @@ def import_python_module(profile_name: str, profile_path: str) -> Optional[Modul
         profile_path (str): Filesystem path to the Python source file; must end with `.py`.
 
     Returns:
-        Optional[ModuleType]: The loaded module on success; `None` if
+        ModuleType | None: The loaded module on success; `None` if
         `profile_path` does not end with `.py`, if a module spec or loader
         cannot be created, or if importing/executing the module fails.
     """
@@ -122,17 +132,7 @@ def import_python_module(profile_name: str, profile_path: str) -> Optional[Modul
 
 
 def is_valid_profile(profile_module: ModuleType) -> bool:
-    """
-    Check whether a module exposes a valid PROFILE_CONFIG with required structure.
-
-    The module must define a `PROFILE_CONFIG` attribute that is a dict and contains a non-empty
-    `system_prompts` entry. This function returns `True` only when `system_prompts` exists
-    and is itself a dict.
-
-    Returns:
-        True if the module provides a dict `PROFILE_CONFIG` containing a
-        `system_prompts` dict, False otherwise.
-    """
+    """Validate that a profile module has the required PROFILE_CONFIG structure."""
     if not hasattr(profile_module, "PROFILE_CONFIG"):
         return False
 

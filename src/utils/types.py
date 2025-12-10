@@ -2,18 +2,13 @@
 
 from typing import Any, Optional
 import json
+from llama_stack_client.lib.agents.event_logger import interleaved_content_as_str
 from llama_stack_client.lib.agents.tool_parser import ToolParser
-from llama_stack_client.lib.agents.types import (
-    CompletionMessage as AgentCompletionMessage,
-    ToolCall as AgentToolCall,
-)
-from llama_stack_client.types.shared.interleaved_content_item import (
-    TextContentItem,
-    ImageContentItem,
-)
-from llama_stack_client.types.alpha.tool_execution_step import ToolExecutionStep
+from llama_stack_client.types.shared.completion_message import CompletionMessage
+from llama_stack_client.types.shared.tool_call import ToolCall
+from llama_stack_client.types.tool_execution_step import ToolExecutionStep
 from pydantic import BaseModel
-from pydantic import Field
+from models.responses import RAGChunk
 from constants import DEFAULT_RAG_TOOL
 
 
@@ -31,9 +26,10 @@ def content_to_str(content: Any) -> str:
         return ""
     if isinstance(content, str):
         return content
-    if isinstance(content, TextContentItem):
+    # Handle content items if they exist
+    if hasattr(content, 'text'):
         return content.text
-    if isinstance(content, ImageContentItem):
+    if hasattr(content, 'image'):
         return "<image>"
     if isinstance(content, list):
         return " ".join(content_to_str(item) for item in content)
@@ -61,18 +57,16 @@ class Singleton(type):
 class GraniteToolParser(ToolParser):
     """Workaround for 'tool_calls' with granite models."""
 
-    def get_tool_calls(
-        self, output_message: AgentCompletionMessage
-    ) -> list[AgentToolCall]:
+    def get_tool_calls(self, output_message: CompletionMessage) -> list[ToolCall]:
         """
         Return the `tool_calls` list from a CompletionMessage, or an empty list if none are present.
 
         Parameters:
-            output_message (Optional[AgentCompletionMessage]): Completion
+            output_message (CompletionMessage | None): Completion
             message potentially containing `tool_calls`.
 
         Returns:
-            list[AgentToolCall]: The list of tool call entries
+            list[ToolCall]: The list of tool call entries
             extracted from `output_message`, or an empty list.
         """
         if output_message and output_message.tool_calls:
@@ -109,14 +103,19 @@ class ShieldModerationResult(BaseModel):
 
 
 class ToolCallSummary(BaseModel):
-    """Model representing a tool call made during response generation (for tool_calls list)."""
+    """Represents a tool call for data collection.
 
-    id: str = Field(description="ID of the tool call")
-    name: str = Field(description="Name of the tool called")
-    args: dict[str, Any] = Field(
-        default_factory=dict, description="Arguments passed to the tool"
-    )
-    type: str = Field("tool_call", description="Type indicator for tool call")
+    Use our own tool call model to keep things consistent across llama
+    upgrades or if we used something besides llama in the future.
+    """
+
+    # ID of the call itself
+    id: str
+    # Name of the tool used
+    name: str
+    # Arguments to the tool call
+    args: str | dict[Any, Any]
+    response: str | None
 
 
 class ToolResultSummary(BaseModel):
@@ -146,8 +145,7 @@ class TurnSummary(BaseModel):
 
     llm_response: str
     tool_calls: list[ToolCallSummary]
-    tool_results: list[ToolResultSummary]
-    rag_chunks: list[RAGChunk]
+    rag_chunks: list[RAGChunk] = []
 
     def append_tool_calls_from_llama(self, tec: ToolExecutionStep) -> None:
         """
@@ -175,49 +173,25 @@ class TurnSummary(BaseModel):
         responses_by_id = {tc.call_id: tc for tc in tec.tool_responses}
         for call_id, tc in calls_by_id.items():
             resp = responses_by_id.get(call_id)
-            response_content = content_to_str(resp.content) if resp else None
+            response_content = (
+                interleaved_content_as_str(resp.content) if resp else None
+            )
 
             self.tool_calls.append(
                 ToolCallSummary(
                     id=call_id,
                     name=tc.tool_name,
-                    args=(
-                        tc.arguments
-                        if isinstance(tc.arguments, dict)
-                        else {"args": str(tc.arguments)}
-                    ),
-                    type="tool_call",
+                    args=tc.arguments,
+                    response=response_content,
                 )
             )
-            self.tool_results.append(
-                ToolResultSummary(
-                    id=call_id,
-                    status="success" if resp else "failure",
-                    content=response_content,
-                    type="tool_result",
-                    round=1,  # clarify meaning of this attribute
-                )
-            )
+
             # Extract RAG chunks from knowledge_search tool responses
             if tc.tool_name == DEFAULT_RAG_TOOL and resp and response_content:
                 self._extract_rag_chunks_from_response(response_content)
 
     def _extract_rag_chunks_from_response(self, response_content: str) -> None:
-        """
-        Parse a tool response string and append extracted RAG chunks to this  rag_chunks list.
-
-        Attempts to parse `response_content` as JSON and extract chunks in either of two formats:
-        - A dict containing a "chunks" list: each item's "content", "source", and "score" are used.
-        - A top-level list of chunk objects: for dict items, "content",
-          "source", and "score" are used; non-dict items are stringified into
-          the chunk content.
-
-        If JSON parsing fails or an unexpected structure/error occurs and
-        `response_content` contains non-whitespace characters, the entire
-        `response_content` is appended as a single RAGChunk with
-        `source=DEFAULT_RAG_TOOL` and `score=None`. Empty or whitespace-only
-        `response_content` is ignored.
-        """
+        """Extract RAG chunks from tool response content."""
         try:
             # Parse the response to get chunks
             # Try JSON first

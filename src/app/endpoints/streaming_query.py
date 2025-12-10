@@ -4,25 +4,28 @@ import ast
 import json
 import logging
 import re
+import traceback
 import uuid
 from collections.abc import Callable
 from datetime import UTC, datetime
 from typing import Annotated, Any, AsyncGenerator, AsyncIterator, Iterator, cast
+from urllib.parse import urljoin
 
-from fastapi import APIRouter, Depends, Request
+from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import StreamingResponse
 from llama_stack_client import (
     APIConnectionError,
     AsyncLlamaStackClient,
     RateLimitError,  # type: ignore
 )
+from llama_stack_client.lib.agents.event_logger import interleaved_content_as_str
 from llama_stack_client.types import UserMessage  # type: ignore
-from llama_stack_client.types.alpha.agents.agent_turn_response_stream_chunk import (
+from llama_stack_client.types.agents.agent_turn_response_stream_chunk import (
     AgentTurnResponseStreamChunk,
 )
+from llama_stack_client.types.agents.turn_create_params import Document
 from llama_stack_client.types.shared import ToolCall
 from llama_stack_client.types.shared.interleaved_content_item import TextContentItem
-from openai._exceptions import APIStatusError
 
 import metrics
 from app.endpoints.query import (
@@ -37,7 +40,6 @@ from app.endpoints.query import (
     validate_attachments_metadata,
     validate_conversation_ownership,
 )
-from app.endpoints.query import parse_referenced_documents
 from authentication import get_auth_dependency
 from authentication.interface import AuthTuple
 from authorization.middleware import authorize
@@ -50,19 +52,17 @@ from models.context import ResponseGeneratorContext
 from models.database.conversations import UserConversation
 from models.requests import QueryRequest
 from models.responses import (
-    AbstractErrorResponse,
     ForbiddenResponse,
     InternalServerErrorResponse,
-    PromptTooLongResponse,
     NotFoundResponse,
     QuotaExceededResponse,
+    RAGChunk,
+    ReferencedDocument,
     ServiceUnavailableResponse,
-    StreamingQueryResponse,
     UnauthorizedResponse,
     UnprocessableEntityResponse,
 )
 from utils.endpoints import (
-    ReferencedDocument,
     check_configuration_loaded,
     cleanup_after_streaming,
     create_rag_chunks_dict,
@@ -71,17 +71,35 @@ from utils.endpoints import (
     validate_model_provider_override,
 )
 from utils.mcp_headers import handle_mcp_headers_with_toolgroups, mcp_headers_dependency
-from utils.quota import get_available_quotas
 from utils.token_counter import TokenCounter, extract_token_usage_from_turn
 from utils.transcripts import store_transcript
-from utils.types import TurnSummary, content_to_str
+from utils.types import TurnSummary
 
 logger = logging.getLogger("app.endpoints.handlers")
 router = APIRouter(tags=["streaming_query"])
 
+# When OFFLINE is False, use reference_url for chunk source
+# When OFFLINE is True, use parent_id for chunk source
+# TODO: move this setting to a higher level configuration
+OFFLINE = True
 
 streaming_query_responses: dict[int | str, dict[str, Any]] = {
-    200: StreamingQueryResponse.openapi_response(),
+    200: {
+        "description": "Streaming response (Server-Sent Events)",
+        "content": {
+            "text/event-stream": {
+                "schema": {"type": "string"},
+                "example": (
+                    'data: {"event": "start", '
+                    '"data": {"conversation_id": "123e4567-e89b-12d3-a456-426614174000"}}\n\n'
+                    'data: {"event": "token", "data": {"id": 0, "token": "Hello"}}\n\n'
+                    'data: {"event": "end", "data": {"referenced_documents": [], '
+                    '"truncated": null, "input_tokens": 0, "output_tokens": 0}, '
+                    '"available_quotas": {}}\n\n'
+                ),
+            }
+        },
+    },
     401: UnauthorizedResponse.openapi_response(
         examples=["missing header", "missing token"]
     ),
@@ -91,7 +109,6 @@ streaming_query_responses: dict[int | str, dict[str, Any]] = {
     404: NotFoundResponse.openapi_response(
         examples=["conversation", "model", "provider"]
     ),
-    413: PromptTooLongResponse.openapi_response(),
     422: UnprocessableEntityResponse.openapi_response(),
     429: QuotaExceededResponse.openapi_response(),
     500: InternalServerErrorResponse.openapi_response(examples=["configuration"]),
@@ -148,10 +165,10 @@ def stream_start_event(conversation_id: str) -> str:
 
 def stream_end_event(
     metadata_map: dict,
+    summary: TurnSummary,
     token_usage: TokenCounter,
-    available_quotas: dict[str, int],
-    referenced_documents: list[ReferencedDocument],
     media_type: str = MEDIA_TYPE_JSON,
+    vector_io_referenced_docs: list[ReferencedDocument] | None = None,
 ) -> str:
     """
     Yield the end of the data stream.
@@ -180,20 +197,43 @@ def stream_end_event(
         )
         return f"\n\n---\n\n{ref_docs_string}" if ref_docs_string else ""
 
-    # Convert ReferencedDocument objects to dicts for JSON serialization
-    # Use mode="json" to ensure AnyUrl is serialized to string (not just model_dump())
-    referenced_docs_dict = [doc.model_dump(mode="json") for doc in referenced_documents]
+    # For JSON media type, we need to create a proper structure
+    # Combine metadata_map documents with vector_io referenced documents
+    referenced_docs_dict = [
+        {
+            "doc_url": v.get("docs_url"),
+            "doc_title": v.get("title"),
+        }
+        for v in metadata_map.values()
+        if "docs_url" in v and "title" in v
+    ]
+
+    # Add vector_io referenced documents
+    if vector_io_referenced_docs:
+        for doc in vector_io_referenced_docs:
+            referenced_docs_dict.append(
+                {
+                    "doc_url": doc.doc_url,
+                    "doc_title": doc.doc_title,
+                }
+            )
+
+    # Convert RAG chunks to dict format
+    rag_chunks_dict = []
+    if summary.rag_chunks:
+        rag_chunks_dict = [chunk.model_dump() for chunk in summary.rag_chunks]
 
     return format_stream_data(
         {
             "event": "end",
             "data": {
+                "rag_chunks": rag_chunks_dict,
                 "referenced_documents": referenced_docs_dict,
                 "truncated": None,  # TODO(jboos): implement truncated
                 "input_tokens": token_usage.input_tokens,
                 "output_tokens": token_usage.output_tokens,
             },
-            "available_quotas": available_quotas,
+            "available_quotas": {},  # TODO(jboos): implement available quotas
         }
     )
 
@@ -361,23 +401,6 @@ def generic_llm_error(error: Exception, media_type: str) -> str:
     )
 
 
-async def stream_http_error(error: AbstractErrorResponse) -> AsyncGenerator[str, None]:
-    """
-    Yield an SSE-formatted error response for generic LLM or API errors.
-
-    Args:
-        error: An AbstractErrorResponse instance representing the error.
-
-    Yields:
-        str: A Server-Sent Events (SSE) formatted error message containing
-            the serialized error details.
-    """
-    logger.error("Error while obtaining answer for user question")
-    logger.exception(error)
-
-    yield format_stream_data({"event": "error", "data": {**error.detail.model_dump()}})
-
-
 # -----------------------------------
 # Turn handling
 # -----------------------------------
@@ -433,7 +456,9 @@ def _handle_turn_complete_event(
         str: SSE-formatted string containing the turn completion
         event and output message content.
     """
-    full_response = content_to_str(chunk.event.payload.turn.output_message.content)
+    full_response = interleaved_content_as_str(
+        chunk.event.payload.turn.output_message.content
+    )
 
     if media_type == MEDIA_TYPE_TEXT:
         yield (
@@ -460,31 +485,31 @@ def _handle_shield_event(
     Processes a shield event chunk and yields a formatted SSE token
     event indicating shield validation results.
 
-    Yields a "No Violation" token if no violation is detected, or a
-    violation message if a shield violation occurs. Increments
-    validation error metrics when violations are present.
+    Only yields events when violations are detected. Successful
+    shield validations (no violations) are silently ignored.
     """
     if chunk.event.payload.event_type == "step_complete":
         violation = chunk.event.payload.step_details.violation
-        if not violation:
-            yield stream_event(
-                data={
-                    "id": chunk_id,
-                    "token": "No Violation",
-                },
-                event_type=LLM_VALIDATION_EVENT,
-                media_type=media_type,
-            )
-        else:
+        if violation:
             # Metric for LLM validation errors
             metrics.llm_calls_validation_errors_total.inc()
-            violation = (
+            violation_msg = (
                 f"Violation: {violation.user_message} (Metadata: {violation.metadata})"
             )
             yield stream_event(
                 data={
                     "id": chunk_id,
-                    "token": violation,
+                    "token": violation_msg,
+                },
+                event_type=LLM_TOKEN_EVENT,
+                media_type=media_type,
+            )
+        else:
+            # Yield "No Violation" message for successful shield validations
+            yield stream_event(
+                data={
+                    "id": chunk_id,
+                    "token": "No Violation",
                 },
                 event_type=LLM_VALIDATION_EVENT,
                 media_type=media_type,
@@ -602,7 +627,7 @@ def _handle_tool_execution_event(
 
         for r in chunk.event.payload.step_details.tool_responses:
             if r.tool_name == "query_from_memory":
-                inserted_context = content_to_str(r.content)
+                inserted_context = interleaved_content_as_str(r.content)
                 yield stream_event(
                     data={
                         "id": chunk_id,
@@ -653,7 +678,7 @@ def _handle_tool_execution_event(
                         "id": chunk_id,
                         "token": {
                             "tool_name": r.tool_name,
-                            "response": content_to_str(r.content),
+                            "response": interleaved_content_as_str(r.content),
                         },
                     },
                     event_type=LLM_TOOL_RESULT_EVENT,
@@ -722,10 +747,9 @@ def create_agent_response_generator(  # pylint: disable=too-many-locals
         """
         chunk_id = 0
         summary = TurnSummary(
-            llm_response="No response from the model",
-            tool_calls=[],
-            tool_results=[],
-            rag_chunks=[],
+            llm_response="No response from the model", 
+            tool_calls=[], 
+            rag_chunks=getattr(context, 'vector_io_rag_chunks', None) or []
         )
 
         # Determine media type for response formatting
@@ -741,7 +765,9 @@ def create_agent_response_generator(  # pylint: disable=too-many-locals
                 continue
             p = chunk.event.payload
             if p.event_type == "turn_complete":
-                summary.llm_response = content_to_str(p.turn.output_message.content)
+                summary.llm_response = interleaved_content_as_str(
+                    p.turn.output_message.content
+                )
                 latest_turn = p.turn
                 system_prompt = get_system_prompt(context.query_request, configuration)
                 try:
@@ -770,19 +796,9 @@ def create_agent_response_generator(  # pylint: disable=too-many-locals
             if latest_turn is not None
             else TokenCounter()
         )
-        referenced_documents = (
-            parse_referenced_documents(latest_turn) if latest_turn is not None else []
-        )
-        available_quotas = get_available_quotas(
-            configuration.quota_limiters, context.user_id
-        )
-        yield stream_end_event(
-            context.metadata_map,
-            token_usage,
-            available_quotas,
-            referenced_documents,
-            media_type,
-        )
+
+        vector_io_referenced_docs = getattr(context, 'vector_io_referenced_docs', None)
+        yield stream_end_event(context.metadata_map, summary, token_usage, media_type, vector_io_referenced_docs)
 
         # Perform cleanup tasks (database and cache operations)
         await cleanup_after_streaming(
@@ -803,6 +819,7 @@ def create_agent_response_generator(  # pylint: disable=too-many-locals
             store_transcript_func=store_transcript,
             persist_user_conversation_details_func=persist_user_conversation_details,
             rag_chunks=create_rag_chunks_dict(summary),
+            vector_io_referenced_docs=vector_io_referenced_docs,
         )
 
     return response_generator
@@ -862,16 +879,12 @@ async def streaming_query_endpoint_handler_base(  # pylint: disable=too-many-loc
                 user_id,
                 query_request.conversation_id,
             )
-            forbidden_error = ForbiddenResponse.conversation(
+            response = ForbiddenResponse.conversation(
                 action="read",
                 resource_id=query_request.conversation_id,
                 user_id=user_id,
             )
-            return StreamingResponse(
-                stream_http_error(forbidden_error),
-                media_type="text/event-stream",
-                status_code=forbidden_error.status_code,
-            )
+            raise HTTPException(**response.model_dump())
 
     try:
         # try to get Llama Stack client
@@ -889,6 +902,12 @@ async def streaming_query_endpoint_handler_base(  # pylint: disable=too-many-loc
             token,
             mcp_headers=mcp_headers,
         )
+
+        # Query vector_io for RAG chunks and referenced documents
+        vector_io_rag_chunks, vector_io_referenced_docs = (
+            await query_vector_io_for_chunks(client, query_request)
+        )
+
         metadata_map: dict[str, dict[str, Any]] = {}
 
         # Create context object for response generator
@@ -904,6 +923,12 @@ async def streaming_query_endpoint_handler_base(  # pylint: disable=too-many-loc
             client=client,
             metadata_map=metadata_map,
         )
+        
+        # Add vector_io data to context if available
+        if hasattr(context, 'vector_io_rag_chunks'):
+            context.vector_io_rag_chunks = vector_io_rag_chunks
+        if hasattr(context, 'vector_io_referenced_docs'):
+            context.vector_io_referenced_docs = vector_io_referenced_docs
 
         # Create the response generator using the provided factory function
         response_generator = create_response_generator_func(context)
@@ -917,47 +942,163 @@ async def streaming_query_endpoint_handler_base(  # pylint: disable=too-many-loc
         return StreamingResponse(
             response_generator(response), media_type="text/event-stream"
         )
+    # connection to Llama Stack server
     except APIConnectionError as e:
+        # Update metrics for the LLM call failure
         metrics.llm_calls_failures_total.inc()
         logger.error("Unable to connect to Llama Stack: %s", e)
-        error_response = ServiceUnavailableResponse(
+        response = ServiceUnavailableResponse(
             backend_name="Llama Stack",
             cause=str(e),
         )
-        return StreamingResponse(
-            stream_http_error(error_response),
-            status_code=error_response.status_code,
-            media_type="text/event-stream",
-        )
+        raise HTTPException(**response.model_dump()) from e
+
     except RateLimitError as e:
         used_model = getattr(e, "model", "")
         if used_model:
-            error_response = QuotaExceededResponse.model(used_model)
+            response = QuotaExceededResponse.model(used_model)
         else:
-            error_response = QuotaExceededResponse(
+            response = QuotaExceededResponse(
                 response="The quota has been exceeded", cause=str(e)
             )
-        return StreamingResponse(
-            stream_http_error(error_response),
-            status_code=error_response.status_code,
-            media_type="text/event-stream",
+        raise HTTPException(**response.model_dump()) from e
+
+    except Exception as e:  # pylint: disable=broad-except
+        # Handle other errors with OLS-compatible error response
+        # This broad exception catch is intentional to ensure all errors
+        # are converted to OLS-compatible streaming responses
+        media_type = query_request.media_type or MEDIA_TYPE_JSON
+        error_response = generic_llm_error(e, media_type)
+
+        async def error_generator() -> AsyncGenerator[str, None]:
+            yield error_response
+
+        # Use text/event-stream for SSE-formatted JSON responses, text/plain for plain text
+        content_type = (
+            "text/event-stream" if media_type == MEDIA_TYPE_JSON else "text/plain"
         )
-    except APIStatusError as e:
-        metrics.llm_calls_failures_total.inc()
-        logger.error("API status error: %s", e)
-        error_response = InternalServerErrorResponse.generic()
-        return StreamingResponse(
-            stream_http_error(error_response),
-            status_code=error_response.status_code,
-            media_type=query_request.media_type or MEDIA_TYPE_JSON,
-        )
+        return StreamingResponse(error_generator(), media_type=content_type)
 
 
-@router.post(
-    "/streaming_query",
-    response_class=StreamingResponse,
-    responses=streaming_query_responses,
-)
+async def query_vector_io_for_chunks(
+    client: AsyncLlamaStackClient,
+    query_request: QueryRequest,
+) -> tuple[list[RAGChunk], list[ReferencedDocument]]:
+    """
+    Query vector_io database for RAG chunks and referenced documents.
+
+    Args:
+        client: AsyncLlamaStackClient for vector database access
+        query_request: The user's query request containing query text and Solr filters
+
+    Returns:
+        tuple: A tuple containing RAG chunks and referenced documents
+    """
+    rag_chunks = []
+    doc_ids_from_chunks = []
+
+    try:
+        # Use the first available vector database if any exist
+        try:
+            # Try vector_stores first (new API)
+            vector_stores = await client.vector_stores.list()
+            vector_db_ids = [vs.id for vs in vector_stores.data]
+        except AttributeError:
+            # Fallback to vector_dbs (old API)
+            vector_dbs = await client.vector_dbs.list()
+            vector_db_ids = [vdb.identifier for vdb in vector_dbs]
+
+        if vector_db_ids:
+            vector_db_id = vector_db_ids[0]  # Use first available vector DB
+
+            params = {"k": 5, "score_threshold": 0.0}
+            logger.info("Initial params: %s", params)
+            logger.info("query_request.solr: %s", query_request.solr)
+            if query_request.solr:
+                # Pass the entire solr dict under the 'solr' key
+                params["solr"] = query_request.solr
+                logger.info("Final params with solr filters: %s", params)
+            else:
+                logger.info("No solr filters provided")
+            logger.info("Final params being sent to vector_io.query: %s", params)
+
+            query_response = await client.vector_io.query(
+                vector_db_id=vector_db_id, query=query_request.query, params=params
+            )
+
+            logger.info("The query response total payload: %s", query_response)
+
+            if query_response.chunks:
+                rag_chunks = [
+                    RAGChunk(
+                        content=str(chunk.content),  # Convert to string if needed
+                        source=getattr(chunk, "doc_id", None)
+                        or getattr(chunk, "source", None),
+                        score=getattr(chunk, "score", None),
+                    )
+                    for chunk in query_response.chunks[:5]  # Limit to top 5 chunks
+                ]
+                logger.info("Retrieved %d chunks from vector DB", len(rag_chunks))
+
+                # Extract doc_ids from chunks for referenced_documents
+                metadata_doc_ids = set()
+                for chunk in query_response.chunks:
+                    metadata = getattr(chunk, "metadata", None)
+                    if metadata and "doc_id" in metadata:
+                        reference_doc = metadata["doc_id"]
+                        logger.info(reference_doc)
+                        if reference_doc and reference_doc not in metadata_doc_ids:
+                            metadata_doc_ids.add(reference_doc)
+                            doc_ids_from_chunks.append(
+                                ReferencedDocument(
+                                    doc_title=metadata.get("title", None),
+                                    doc_url="https://mimir.corp.redhat.com"
+                                    + reference_doc,
+                                )
+                            )
+
+                logger.info(
+                    "Extracted %d unique document IDs from chunks",
+                    len(doc_ids_from_chunks),
+                )
+
+                # Convert retrieved chunks to RAGChunk format with proper source handling
+                final_rag_chunks = []
+                for chunk in query_response.chunks[:5]:
+                    # Extract source from chunk metadata based on OFFLINE flag
+                    source = None
+                    if chunk.metadata:
+                        if OFFLINE:
+                            parent_id = chunk.metadata.get("parent_id")
+                            if parent_id:
+                                source = urljoin(
+                                    "https://mimir.corp.redhat.com", parent_id
+                                )
+                        else:
+                            source = chunk.metadata.get("reference_url")
+
+                    # Get score from chunk if available
+                    score = getattr(chunk, "score", None)
+
+                    final_rag_chunks.append(
+                        RAGChunk(
+                            content=chunk.content,
+                            source=source,
+                            score=score,
+                        )
+                    )
+
+                return final_rag_chunks, doc_ids_from_chunks
+
+    except Exception as e:  # pylint: disable=broad-except
+        logger.warning("Failed to query vector database for chunks: %s", e)
+        logger.debug("Vector DB query error details: %s", traceback.format_exc())
+        # Continue without RAG chunks
+
+    return rag_chunks, doc_ids_from_chunks
+
+
+@router.post("/streaming_query", responses=streaming_query_responses)
 @authorize(Action.STREAMING_QUERY)
 async def streaming_query_endpoint_handler(  # pylint: disable=too-many-locals,too-many-statements
     request: Request,
@@ -968,23 +1109,16 @@ async def streaming_query_endpoint_handler(  # pylint: disable=too-many-locals,t
     """
     Handle request to the /streaming_query endpoint using Agent API.
 
-    Returns a streaming response using Server-Sent Events (SSE) format with
-    content type text/event-stream.
+    This is a wrapper around streaming_query_endpoint_handler_base that provides
+    the Agent API specific retrieve_response and response generator functions.
 
     Returns:
         StreamingResponse: An HTTP streaming response yielding
-        SSE-formatted events for the query lifecycle with content type
-        text/event-stream.
+        SSE-formatted events for the query lifecycle.
 
     Raises:
-        HTTPException:
-            - 401: Unauthorized - Missing or invalid credentials
-            - 403: Forbidden - Insufficient permissions or model override not allowed
-            - 404: Not Found - Conversation, model, or provider not found
-            - 422: Unprocessable Entity - Request validation failed
-            - 429: Too Many Requests - Quota limit exceeded
-            - 500: Internal Server Error - Configuration not loaded or other server errors
-            - 503: Service Unavailable - Unable to connect to Llama Stack backend
+        HTTPException: Returns HTTP 500 if unable to connect to the
+        Llama Stack server.
     """
     return await streaming_query_endpoint_handler_base(
         request=request,
@@ -1092,33 +1226,114 @@ async def retrieve_response(
         if query_request.vector_store_ids:
             vector_db_ids = query_request.vector_store_ids
         else:
-            vector_db_ids = [
-                vector_store.id
-                for vector_store in (await client.vector_stores.list()).data
-            ]
-        toolgroups = (get_rag_toolgroups(vector_db_ids) or []) + [
-            mcp_server.name for mcp_server in configuration.mcp_servers
-        ]
+            try:
+                # Try vector_stores first (new API)
+                vector_stores = await client.vector_stores.list()
+                vector_db_ids = [vs.id for vs in vector_stores.data]
+            except AttributeError:
+                # Fallback to vector_dbs (old API)
+                vector_dbs = await client.vector_dbs.list()
+                vector_db_ids = [vdb.identifier for vdb in vector_dbs]
+        
+        mcp_toolgroups = [mcp_server.name for mcp_server in configuration.mcp_servers]
+
+        toolgroups = None
+        if vector_db_ids:
+            toolgroups = get_rag_toolgroups(vector_db_ids) + mcp_toolgroups
+        elif mcp_toolgroups:
+            toolgroups = mcp_toolgroups
         # Convert empty list to None for consistency with existing behavior
-        if not toolgroups:
+        if toolgroups == []:
             toolgroups = None
 
     # TODO: LCORE-881 - Remove if Llama Stack starts to support these mime types
-    # documents: list[Document] = [
-    #     (
-    #         {"content": doc["content"], "mime_type": "text/plain"}
-    #         if doc["mime_type"].lower() in ("application/json", "application/xml")
-    #         else doc
-    #     )
-    #     for doc in query_request.get_documents()
-    # ]
+    documents: list[Document] = [
+        (
+            {"content": doc["content"], "mime_type": "text/plain"}
+            if doc["mime_type"].lower() in ("application/json", "application/xml")
+            else doc
+        )
+        for doc in query_request.get_documents()
+    ]
+
+    # Get RAG chunks before sending to LLM (reuse logic from query_vector_io_for_chunks)
+    rag_chunks = []
+    try:
+        if vector_db_ids:
+            vector_db_id = vector_db_ids[0]  # Use first available vector DB
+
+            params = {"k": 5, "score_threshold": 0.0}
+            logger.info("Initial params: %s", params)
+            logger.info("query_request.solr: %s", query_request.solr)
+            if query_request.solr:
+                # Pass the entire solr dict under the 'solr' key
+                params["solr"] = query_request.solr
+                logger.info("Final params with solr filters: %s", params)
+            else:
+                logger.info("No solr filters provided")
+            logger.info("Final params being sent to vector_io.query: %s", params)
+
+            query_response = await client.vector_io.query(
+                vector_db_id=vector_db_id, query=query_request.query, params=params
+            )
+
+            logger.info("The query response total payload: %s", query_response)
+
+            if query_response.chunks:
+                # Convert retrieved chunks to RAGChunk format with proper source handling
+                for chunk in query_response.chunks[:5]:
+                    # Extract source from chunk metadata based on OFFLINE flag
+                    source = None
+                    if chunk.metadata:
+                        if OFFLINE:
+                            parent_id = chunk.metadata.get("parent_id")
+                            if parent_id:
+                                source = urljoin(
+                                    "https://mimir.corp.redhat.com", parent_id
+                                )
+                        else:
+                            source = chunk.metadata.get("reference_url")
+
+                    # Get score from chunk if available
+                    score = getattr(chunk, "score", None)
+
+                    rag_chunks.append(
+                        RAGChunk(
+                            content=chunk.content,
+                            source=source,
+                            score=score,
+                        )
+                    )
+
+                logger.info(
+                    "Retrieved %d chunks from vector DB for streaming", len(rag_chunks)
+                )
+
+    except Exception as e:
+        logger.warning("Failed to query vector database for chunks: %s", e)
+        logger.debug("Vector DB query error details: %s", traceback.format_exc())
+
+    # Format RAG context for injection into user message
+    rag_context = ""
+    if rag_chunks:
+        context_chunks = []
+        for chunk in rag_chunks[:5]:  # Limit to top 5 chunks
+            chunk_text = f"Source: {chunk.source or 'Unknown'}\n{chunk.content}"
+            context_chunks.append(chunk_text)
+        rag_context = "\n\nRelevant documentation:\n" + "\n\n".join(context_chunks)
+        logger.info(
+            "Injecting %d RAG chunks into streaming user message", len(context_chunks)
+        )
+
+    # Inject RAG context into user message
+    user_content = query_request.query + rag_context
 
     response = await agent.create_turn(
-        messages=[UserMessage(role="user", content=query_request.query).model_dump()],
+        messages=[UserMessage(role="user", content=user_content)],
         session_id=session_id,
-        # documents=documents,
+        documents=documents,
         stream=True,
-        # toolgroups=toolgroups,
+        toolgroups=toolgroups,
     )
     response = cast(AsyncIterator[AgentTurnResponseStreamChunk], response)
 

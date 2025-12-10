@@ -112,7 +112,7 @@ class TestTransformChatMessage:
         ref_docs = assistant_message["referenced_documents"]
         assert len(ref_docs) == 1
         assert ref_docs[0]["doc_title"] == "Test Doc"
-        assert str(ref_docs[0]["doc_url"]) == "http://example.com/"
+        assert str(ref_docs[0]["doc_url"]) == "http://example.com"
 
     def test_transform_message_with_empty_referenced_documents(self) -> None:
         """Test the transformation when referenced_documents is an empty list."""
@@ -595,18 +595,16 @@ class TestDeleteConversationEndpoint:
         mock_authorization_resolvers(mocker)
         mocker.patch("app.endpoints.conversations_v2.configuration", mock_configuration)
         mocker.patch("app.endpoints.conversations_v2.check_suid", return_value=True)
-        mock_configuration.conversation_cache.delete.return_value = False
+        mock_configuration.conversation_cache.list.return_value = []
 
-        response = await delete_conversation_endpoint_handler(
-            request=mocker.Mock(),
-            conversation_id=VALID_CONVERSATION_ID,
-            auth=MOCK_AUTH,
-        )
+        with pytest.raises(HTTPException) as exc_info:
+            await delete_conversation_endpoint_handler(
+                request=mocker.Mock(),
+                conversation_id=VALID_CONVERSATION_ID,
+                auth=MOCK_AUTH,
+            )
 
-        assert response is not None
-        assert response.conversation_id == VALID_CONVERSATION_ID
-        assert response.success is True
-        assert response.response == "Conversation cannot be deleted"
+        assert exc_info.value.status_code == status.HTTP_404_NOT_FOUND
 
     @pytest.mark.asyncio
     async def test_successful_deletion(

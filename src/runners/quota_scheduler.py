@@ -30,20 +30,7 @@ logger = get_logger(__name__)
 
 # pylint: disable=R0912
 def quota_scheduler(config: QuotaHandlersConfiguration) -> bool:
-    """
-    Run the quota scheduler loop that applies configured quota limiters periodically.
-
-    Parameters:
-        config (QuotaHandlersConfiguration): Configuration containing storage
-        settings (sqlite or postgres), a list of limiter configurations, and
-        scheduler.period in seconds. If configuration is invalid or no
-        storage/limiters are configured, the scheduler will not start.
-
-    Returns:
-        bool: `True` if the scheduler started (unreachable in normal execution
-        because the function enters an infinite loop), `False` if validation
-        failed or a database connection could not be established.
-    """
+    """Quota scheduler task."""
     if config is None:
         logger.warning("Quota limiters are not configured, skipping")
         return False
@@ -142,29 +129,14 @@ def connected(connection: Any) -> bool:
 
 
 def get_increase_quota_statement(config: QuotaHandlersConfiguration) -> str:
-    """
-    Select the SQL statement used to increase stored quota according to the database backend.
-
-    Parameters:
-        config (QuotaHandlersConfiguration): Configuration that indicates which
-        storage backend (SQLite or PostgreSQL) is in use.
-
-    Returns:
-        str: SQL statement to perform a quota increase appropriate for the configured backend.
-    """
+    """Get the SQL statement to increase quota."""
     if config.sqlite is not None:
         return INCREASE_QUOTA_STATEMENT_SQLITE
     return INCREASE_QUOTA_STATEMENT_PG
 
 
 def get_reset_quota_statement(config: QuotaHandlersConfiguration) -> str:
-    """
-    Return the SQL statement used to reset quota records for the configured database backend.
-
-    Returns:
-        str: The SQLite reset SQL statement when `config.sqlite` is set,
-        otherwise the PostgreSQL reset SQL statement.
-    """
+    """Get the SQL statement to reset quota."""
     if config.sqlite is not None:
         return RESET_QUOTA_STATEMENT_SQLITE
     return RESET_QUOTA_STATEMENT_PG
@@ -176,21 +148,7 @@ def quota_revocation(
     increase_quota_statement: str,
     reset_quota_statement: str,
 ) -> None:
-    """
-    Apply configured quota updates for a quota limiter using the provided database connection.
-
-    Processes the given limiter: increases quota when `quota_increase` is set
-    and resets initial quota when `initial_quota` is greater than zero, using
-    the supplied SQL statements.
-
-    Parameters:
-        quota_limiter (QuotaLimiterConfiguration): Limiter configuration to process.
-        increase_quota_statement (str): SQL statement used to increment quota values.
-        reset_quota_statement (str): SQL statement used to reset quota values.
-
-    Raises:
-        ValueError: If the limiter's `type` or `period` is not set.
-    """
+    """Quota revocation mechanism."""
     logger.info(
         "Quota revocation mechanism for limiter '%s' of type '%s'",
         quota_limiter.name,
@@ -231,22 +189,7 @@ def increase_quota(
     increase_by: int,
     period: str,
 ) -> None:
-    """
-    Increase the stored quota for a subject by a specified amount for a given period.
-
-    Executes the provided SQL update statement on the given database connection
-    to increment the quota value for the specified subject and period.
-
-    Parameters:
-        connection (Any): Database connection object (Postgres or SQLite) to
-                          execute the statement on.
-        update_statement (str): SQL update statement that accepts parameters
-                                (increase_by, subject_id, period).
-        subject_id (str): Identifier for the subject whose quota is modified
-                          (e.g., "u" for user, "c" for cluster).
-        increase_by (int): Amount to add to the subject's quota.
-        period (str): Quota period identifier used to scope the update.
-    """
+    """Increase quota by specified amount."""
     logger.info(
         "Increasing quota for subject '%s' by %d when period %s is reached",
         subject_id,
@@ -277,17 +220,7 @@ def reset_quota(
     reset_to: int,
     period: str,
 ) -> None:
-    """
-    Set the stored quota for a subject to a specific value for the given period.
-
-    Parameters:
-        connection (Any): Database connection object used to execute the update.
-        update_statement (str): SQL statement that sets the quota value
-                                (expects parameters: new_value, subject_id, period).
-        subject_id (str): Identifier for the quota subject (e.g., "u" for user, "c" for cluster).
-        reset_to (int): Value to set the subject's quota to.
-        period (str): Period identifier for which the quota is being set.
-    """
+    """Reset quota to specified amount."""
     logger.info(
         "Resetting quota for subject '%s' to %d when period %s is reached",
         subject_id,
@@ -312,16 +245,7 @@ def reset_quota(
 
 
 def get_subject_id(limiter_type: str) -> str:
-    """
-    Map a quota limiter type to its subject identifier.
-
-    Parameters:
-        limiter_type (str): Quota limiter type constant (e.g., user or cluster).
-
-    Returns:
-        str: `"u"` for a user limiter, `"c"` for a cluster limiter, or `"?"` if the type
-             is not recognized.
-    """
+    """Get subject ID based on quota limiter type."""
     match limiter_type:
         case constants.USER_QUOTA_LIMITER:
             return "u"
@@ -332,17 +256,7 @@ def get_subject_id(limiter_type: str) -> str:
 
 
 def connect(config: QuotaHandlersConfiguration) -> Any:
-    """
-    Create and return a database connection for quota handlers based on the configured backend.
-
-    Parameters:
-        config (QuotaHandlersConfiguration): Configuration containing
-        `postgres` or `sqlite` connection settings.
-
-    Returns:
-        A database connection suitable for quota operations, or `None` if
-        neither Postgres nor SQLite is configured.
-    """
+    """Initialize connection to database."""
     logger.info("Initializing connection to quota limiter database")
     if config.postgres is not None:
         return connect_pg(config.postgres)
@@ -368,13 +282,7 @@ def init_tables(connection: Any, create_quota_table: str) -> None:
 
 
 def start_quota_scheduler(configuration: Configuration) -> None:
-    """
-    Start the quota scheduler in a daemon thread using the provided configuration.
-
-    Parameters:
-        configuration (Configuration): Global configuration whose `quota_handlers`
-                                       attribute is passed to the scheduler thread.
-    """
+    """Start user and cluster quota scheduler in separate thread."""
     logger.info("Starting quota scheduler")
     thread = Thread(
         target=quota_scheduler,

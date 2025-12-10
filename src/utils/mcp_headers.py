@@ -32,7 +32,7 @@ def extract_mcp_headers(request: Request) -> dict[str, dict[str, str]]:
     If the header is missing, contains invalid JSON, or the decoded
     value is not a dictionary, an empty dictionary is returned.
 
-    Parameters:
+    Args:
         request: The FastAPI request object
 
     Returns:

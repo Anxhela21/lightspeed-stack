@@ -49,6 +49,7 @@ conversation_delete_responses: dict[int | str, dict[str, Any]] = {
         examples=["missing header", "missing token"]
     ),
     403: ForbiddenResponse.openapi_response(examples=["endpoint"]),
+    404: NotFoundResponse.openapi_response(examples=["conversation"]),
     500: InternalServerErrorResponse.openapi_response(
         examples=["conversation cache", "configuration"]
     ),
@@ -160,6 +161,8 @@ async def delete_conversation_endpoint_handler(
         logger.warning("Converastion cache is not configured")
         response = InternalServerErrorResponse.cache_unavailable()
         raise HTTPException(**response.model_dump())
+
+    check_conversation_existence(user_id, conversation_id)
 
     logger.info("Deleting conversation %s for user %s", conversation_id, user_id)
     deleted = configuration.conversation_cache.delete(

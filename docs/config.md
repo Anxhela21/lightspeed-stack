@@ -29,17 +29,6 @@ Attributes:
 | postgres |  | PostgreSQL database configuration for A2A state storage. |
 
 
-## APIKeyTokenConfiguration
-
-
-API Key Token configuration.
-
-
-| Field | Type | Description |
-|-------|------|-------------|
-| api_key | string |  |
-
-
 ## AccessRule
 
 
@@ -75,7 +64,6 @@ Authentication configuration.
 | k8s_cluster_api | string |  |
 | k8s_ca_cert_path | string |  |
 | jwk_config |  |  |
-| api_key_config |  |  |
 | rh_identity_config |  |  |
 
 
@@ -334,11 +322,11 @@ Useful resources:
 
 Model context protocol server configuration.
 
-MCP (Model Context Protocol) servers provide tools and capabilities to the
-AI agents. These are configured by this structure. Only MCP servers
-defined in the lightspeed-stack.yaml configuration are available to the
-agents. Tools configured in the llama-stack run.yaml are not accessible to
-lightspeed-core agents.
+MCP (Model Context Protocol) servers provide tools and
+capabilities to the AI agents. These are configured by this structure.
+Only MCP servers defined in the lightspeed-stack.yaml configuration are
+available to the agents. Tools configured in the llama-stack run.yaml
+are not accessible to lightspeed-core agents.
 
 Useful resources:
 
@@ -359,9 +347,9 @@ Useful resources:
 
 PostgreSQL database configuration.
 
-PostgreSQL database is used by Lightspeed Core Stack service for storing
-information about conversation IDs. It can also be leveraged to store
-conversation history and information about quota usage.
+PostgreSQL database is used by Lightspeed Core Stack service for storing information about
+conversation IDs. It can also be leveraged to store conversation history and information
+about quota usage.
 
 Useful resources:
 
@@ -476,10 +464,10 @@ SQLite database configuration.
 
 Service configuration.
 
-Lightspeed Core Stack is a REST API service that accepts requests on a
-specified hostname and port. It is also possible to enable authentication
-and specify the number of Uvicorn workers. When more workers are specified,
-the service can handle requests concurrently.
+Lightspeed Core Stack is a REST API service that accepts requests
+on a specified hostname and port. It is also possible to enable
+authentication and specify the number of Uvicorn workers. When more
+workers are specified, the service can handle requests concurrently.
 
 
 | Field | Type | Description |
