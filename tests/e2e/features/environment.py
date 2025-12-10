@@ -7,18 +7,19 @@ Currently four events have been registered:
 4. after_scenario
 """
 
-import requests
+import os
 import subprocess
 import time
-import os
-from behave.model import Scenario, Feature
+
+import requests
+from behave.model import Feature, Scenario
 from behave.runner import Context
 
 from tests.e2e.utils.utils import (
-    switch_config,
-    restart_container,
-    remove_config_backup,
     create_config_backup,
+    remove_config_backup,
+    restart_container,
+    switch_config,
 )
 
 
@@ -50,6 +51,12 @@ def _fetch_models_from_service() -> dict:
 
 def before_all(context: Context) -> None:
     """Run before and after the whole shooting match."""
+    # Detect deployment mode from environment variable
+    context.deployment_mode = os.getenv("E2E_DEPLOYMENT_MODE", "server").lower()
+    context.is_library_mode = context.deployment_mode == "library"
+
+    print(f"Running tests in {context.deployment_mode} mode")
+
     # Get first LLM model from running service
     llm_model = _fetch_models_from_service()
 
@@ -74,9 +81,19 @@ def before_scenario(context: Context, scenario: Scenario) -> None:
     if "local" in scenario.effective_tags and not context.local:
         scenario.skip("Marked with @local")
         return
+
+    # Skip scenarios that require separate llama-stack container in library mode
+    if context.is_library_mode and "skip-in-library-mode" in scenario.effective_tags:
+        scenario.skip("Skipped in library mode (no separate llama-stack container)")
+        return
+
+    mode_dir = "library-mode" if context.is_library_mode else "server-mode"
+
     if "InvalidFeedbackStorageConfig" in scenario.effective_tags:
+        context.scenario_config = f"tests/e2e/configuration/{mode_dir}/lightspeed-stack-invalid-feedback-storage.yaml"
+    if "NoCacheConfig" in scenario.effective_tags:
         context.scenario_config = (
-            "tests/e2e/configuration/lightspeed-stack-invalid-feedback-storage.yaml"
+            f"tests/e2e/configuration/{mode_dir}/lightspeed-stack-no-cache.yaml"
         )
 
 
@@ -85,9 +102,16 @@ def after_scenario(context: Context, scenario: Scenario) -> None:
     if "InvalidFeedbackStorageConfig" in scenario.effective_tags:
         switch_config(context.feature_config)
         restart_container("lightspeed-stack")
+    if "NoCacheConfig" in scenario.effective_tags:
+        switch_config(context.feature_config)
+        restart_container("lightspeed-stack")
 
-    # Restore Llama Stack connection if it was disrupted
-    if hasattr(context, "llama_stack_was_running") and context.llama_stack_was_running:
+    # Restore Llama Stack connection if it was disrupted (only in server mode)
+    if (
+        not context.is_library_mode
+        and hasattr(context, "llama_stack_was_running")
+        and context.llama_stack_was_running
+    ):
         try:
             # Start the llama-stack container again
             subprocess.run(
@@ -96,7 +120,7 @@ def after_scenario(context: Context, scenario: Scenario) -> None:
 
             # Wait for the service to be healthy
             print("Restoring Llama Stack connection...")
-            time.sleep(5)
+            time.sleep(20)
 
             # Check if it's healthy
             for attempt in range(6):  # Try for 30 seconds
@@ -137,8 +161,9 @@ def after_scenario(context: Context, scenario: Scenario) -> None:
 def before_feature(context: Context, feature: Feature) -> None:
     """Run before each feature file is exercised."""
     if "Authorized" in feature.tags:
+        mode_dir = "library-mode" if context.is_library_mode else "server-mode"
         context.feature_config = (
-            "tests/e2e/configuration/lightspeed-stack-auth-noop-token.yaml"
+            f"tests/e2e/configuration/{mode_dir}/lightspeed-stack-auth-noop-token.yaml"
         )
         context.default_config_backup = create_config_backup("lightspeed-stack.yaml")
         switch_config(context.feature_config)

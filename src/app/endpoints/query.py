@@ -9,12 +9,13 @@ from datetime import UTC, datetime
 from typing import Annotated, Any, Optional, cast
 from urllib.parse import urljoin
 
-from fastapi import APIRouter, Depends, HTTPException, Request, status
+from fastapi import APIRouter, Depends, HTTPException, Request
+from litellm.exceptions import RateLimitError
 from llama_stack_client import (
     APIConnectionError,
+    APIStatusError,
     AsyncLlamaStackClient,  # type: ignore
 )
-from llama_stack_client.lib.agents.event_logger import interleaved_content_as_str
 from llama_stack_client.types import Shield, UserMessage  # type: ignore
 from llama_stack_client.types.agents.turn import Turn
 from llama_stack_client.types.agents.turn_create_params import (
@@ -24,7 +25,8 @@ from llama_stack_client.types.agents.turn_create_params import (
 )
 from llama_stack_client.types.model_list_response import ModelListResponse
 from llama_stack_client.types.shared.interleaved_content_item import TextContentItem
-from llama_stack_client.types.tool_execution_step import ToolExecutionStep
+from llama_stack_client.types.alpha.tool_execution_step import ToolExecutionStep
+from sqlalchemy.exc import SQLAlchemyError
 
 import constants
 import metrics
@@ -40,10 +42,15 @@ from models.database.conversations import UserConversation
 from models.requests import Attachment, QueryRequest
 from models.responses import (
     ForbiddenResponse,
+    InternalServerErrorResponse,
+    NotFoundResponse,
     QueryResponse,
+    PromptTooLongResponse,
+    QuotaExceededResponse,
     ReferencedDocument,
-    ToolCall,
+    ServiceUnavailableResponse,
     UnauthorizedResponse,
+    UnprocessableEntityResponse,
 )
 from utils.endpoints import (
     check_configuration_loaded,
@@ -63,7 +70,7 @@ from utils.quota import (
 )
 from utils.token_counter import TokenCounter, extract_and_update_token_metrics
 from utils.transcripts import store_transcript
-from utils.types import TurnSummary
+from utils.types import TurnSummary, content_to_str
 
 logger = logging.getLogger("app.endpoints.handlers")
 router = APIRouter(tags=["query"])
@@ -74,31 +81,21 @@ router = APIRouter(tags=["query"])
 OFFLINE = True
 
 query_response: dict[int | str, dict[str, Any]] = {
-    200: {
-        "conversation_id": "123e4567-e89b-12d3-a456-426614174000",
-        "response": "LLM answer",
-        "referenced_documents": [
-            {
-                "doc_url": "https://docs.openshift.com/"
-                "container-platform/4.15/operators/olm/index.html",
-                "doc_title": "Operator Lifecycle Manager (OLM)",
-            }
-        ],
-    },
-    400: {
-        "description": "Missing or invalid credentials provided by client",
-        "model": UnauthorizedResponse,
-    },
-    403: {
-        "description": "User is not authorized",
-        "model": ForbiddenResponse,
-    },
-    500: {
-        "detail": {
-            "response": "Unable to connect to Llama Stack",
-            "cause": "Connection error.",
-        }
-    },
+    200: QueryResponse.openapi_response(),
+    401: UnauthorizedResponse.openapi_response(
+        examples=["missing header", "missing token"]
+    ),
+    403: ForbiddenResponse.openapi_response(
+        examples=["endpoint", "conversation read", "model override"]
+    ),
+    404: NotFoundResponse.openapi_response(
+        examples=["model", "conversation", "provider"]
+    ),
+    413: PromptTooLongResponse.openapi_response(),
+    422: UnprocessableEntityResponse.openapi_response(),
+    429: QuotaExceededResponse.openapi_response(),
+    500: InternalServerErrorResponse.openapi_response(examples=["configuration"]),
+    503: ServiceUnavailableResponse.openapi_response(),
 }
 
 
@@ -205,14 +202,14 @@ async def get_topic_summary(
         client, model_id, topic_summary_system_prompt
     )
     response = await agent.create_turn(
-        messages=[UserMessage(role="user", content=question)],
+        messages=[UserMessage(role="user", content=question).model_dump()],
         session_id=session_id,
         stream=False,
-        toolgroups=None,
+        # toolgroups=None,
     )
     response = cast(Turn, response)
     return (
-        interleaved_content_as_str(response.output_message.content)
+        content_to_str(response.output_message.content)
         if (
             getattr(response, "output_message", None) is not None
             and getattr(response.output_message, "content", None) is not None
@@ -281,13 +278,11 @@ async def query_endpoint_handler_base(  # pylint: disable=R0914
                 query_request.conversation_id,
                 user_id,
             )
-            raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND,
-                detail={
-                    "response": "Conversation not found",
-                    "cause": "The requested conversation does not exist.",
-                },
+            response = NotFoundResponse(
+                resource="conversation", resource_id=query_request.conversation_id
             )
+            raise HTTPException(**response.model_dump())
+
     else:
         logger.debug("Query does not contain conversation ID")
 
@@ -322,9 +317,19 @@ async def query_endpoint_handler_base(  # pylint: disable=R0914
                 session.query(UserConversation).filter_by(id=conversation_id).first()
             )
             if not existing_conversation:
-                topic_summary = await get_topic_summary_func(
-                    query_request.query, client, llama_stack_model_id
-                )
+                # Check if topic summary should be generated (default: True)
+                should_generate = query_request.generate_topic_summary
+
+                if should_generate:
+                    logger.debug("Generating topic summary for new conversation")
+                    topic_summary = await get_topic_summary_func(
+                        query_request.query, client, llama_stack_model_id
+                    )
+                else:
+                    logger.debug(
+                        "Topic summary generation disabled by request parameter"
+                    )
+                    topic_summary = None
         # Convert RAG chunks to dictionary format once for reuse
         logger.info("Processing RAG chunks...")
         rag_chunks_dict = [chunk.model_dump() for chunk in summary.rag_chunks]
@@ -385,20 +390,6 @@ async def query_endpoint_handler_base(  # pylint: disable=R0914
 
         # Convert tool calls to response format
         logger.info("Processing tool calls...")
-        tool_calls = [
-            ToolCall(
-                tool_name=tc.name,
-                arguments=(
-                    tc.args if isinstance(tc.args, dict) else {"query": str(tc.args)}
-                ),
-                result=(
-                    {"response": tc.response}
-                    if tc.response and tc.name != constants.DEFAULT_RAG_TOOL
-                    else None
-                ),
-            )
-            for tc in summary.tool_calls
-        ]
 
         logger.info("Using referenced documents from response...")
 
@@ -408,8 +399,8 @@ async def query_endpoint_handler_base(  # pylint: disable=R0914
         response = QueryResponse(
             conversation_id=conversation_id,
             response=summary.llm_response,
-            rag_chunks=summary.rag_chunks if summary.rag_chunks else [],
-            tool_calls=tool_calls if tool_calls else None,
+            tool_calls=summary.tool_calls if summary.tool_calls else None,
+            tool_results=summary.tool_results if summary.tool_results else None,
             referenced_documents=referenced_documents,
             truncated=False,  # TODO: implement truncation detection
             input_tokens=token_usage.input_tokens,
@@ -424,13 +415,28 @@ async def query_endpoint_handler_base(  # pylint: disable=R0914
         # Update metrics for the LLM call failure
         metrics.llm_calls_failures_total.inc()
         logger.error("Unable to connect to Llama Stack: %s", e)
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail={
-                "response": "Unable to connect to Llama Stack",
-                "cause": str(e),
-            },
-        ) from e
+        response = ServiceUnavailableResponse(
+            backend_name="Llama Stack",
+            cause=str(e),
+        )
+        raise HTTPException(**response.model_dump()) from e
+    except SQLAlchemyError as e:
+        logger.exception("Error persisting conversation details.")
+        response = InternalServerErrorResponse.database_error()
+        raise HTTPException(**response.model_dump()) from e
+    except RateLimitError as e:
+        used_model = getattr(e, "model", "")
+        if used_model:
+            response = QuotaExceededResponse.model(used_model)
+        else:
+            response = QuotaExceededResponse(
+                response="The quota has been exceeded", cause=str(e)
+            )
+        raise HTTPException(**response.model_dump()) from e
+    except APIStatusError as e:
+        logger.exception("Error in query endpoint handler: %s", e)
+        response = InternalServerErrorResponse.generic()
+        raise HTTPException(**response.model_dump()) from e
 
 
 @router.post("/query", responses=query_response)
@@ -513,31 +519,21 @@ def select_model_and_provider_id(
         except (StopIteration, AttributeError) as e:
             message = "No LLM model found in available models"
             logger.error(message)
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail={
-                    "response": constants.UNABLE_TO_PROCESS_RESPONSE,
-                    "cause": message,
-                },
-            ) from e
+            response = NotFoundResponse(resource="model", resource_id=model_id or "")
+            raise HTTPException(**response.model_dump()) from e
 
     llama_stack_model_id = f"{provider_id}/{model_id}"
     # Validate that the model_id and provider_id are in the available models
     logger.debug("Searching for model: %s, provider: %s", model_id, provider_id)
+    # TODO: Create sepparate validation of provider
     if not any(
         m.identifier == llama_stack_model_id and m.provider_id == provider_id
         for m in models
     ):
         message = f"Model {model_id} from provider {provider_id} not found in available models"
         logger.error(message)
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail={
-                "response": constants.UNABLE_TO_PROCESS_RESPONSE,
-                "cause": message,
-            },
-        )
-
+        response = NotFoundResponse(resource="model", resource_id=model_id)
+        raise HTTPException(**response.model_dump())
     return llama_stack_model_id, model_id, provider_id
 
 
@@ -758,14 +754,14 @@ async def retrieve_response(  # pylint: disable=too-many-locals,too-many-branche
             toolgroups = None
 
     # TODO: LCORE-881 - Remove if Llama Stack starts to support these mime types
-    documents: list[Document] = [
-        (
-            {"content": doc["content"], "mime_type": "text/plain"}
-            if doc["mime_type"].lower() in ("application/json", "application/xml")
-            else doc
-        )
-        for doc in query_request.get_documents()
-    ]
+    # documents: list[Document] = [
+    #     (
+    #         {"content": doc["content"], "mime_type": "text/plain"}
+    #         if doc["mime_type"].lower() in ("application/json", "application/xml")
+    #         else doc
+    #     )
+    #     for doc in query_request.get_documents()
+    # ]
 
     # Extract RAG chunks from vector DB query response BEFORE calling agent
     rag_chunks = []
@@ -869,15 +865,15 @@ async def retrieve_response(  # pylint: disable=too-many-locals,too-many-branche
     response = await agent.create_turn(
         messages=[UserMessage(role="user", content=user_content)],
         session_id=session_id,
-        documents=documents,
+        # documents=documents,
         stream=False,
-        toolgroups=toolgroups,
+        # toolgroups=toolgroups,
     )
     response = cast(Turn, response)
 
     summary = TurnSummary(
         llm_response=(
-            interleaved_content_as_str(response.output_message.content)
+            content_to_str(response.output_message.content)
             if (
                 getattr(response, "output_message", None) is not None
                 and getattr(response.output_message, "content", None) is not None
@@ -926,26 +922,24 @@ def validate_attachments_metadata(attachments: list[Attachment]) -> None:
     for attachment in attachments:
         if attachment.attachment_type not in constants.ATTACHMENT_TYPES:
             message = (
-                f"Attachment with improper type {attachment.attachment_type} detected"
+                f"Invalid attatchment type {attachment.attachment_type}: "
+                f"must be one of {constants.ATTACHMENT_TYPES}"
             )
             logger.error(message)
-            raise HTTPException(
-                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-                detail={
-                    "response": constants.UNABLE_TO_PROCESS_RESPONSE,
-                    "cause": message,
-                },
+            response = UnprocessableEntityResponse(
+                response="Invalid attribute value", cause=message
             )
+            raise HTTPException(**response.model_dump())
         if attachment.content_type not in constants.ATTACHMENT_CONTENT_TYPES:
-            message = f"Attachment with improper content type {attachment.content_type} detected"
-            logger.error(message)
-            raise HTTPException(
-                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-                detail={
-                    "response": constants.UNABLE_TO_PROCESS_RESPONSE,
-                    "cause": message,
-                },
+            message = (
+                f"Invalid attatchment content type {attachment.content_type}: "
+                f"must be one of {constants.ATTACHMENT_CONTENT_TYPES}"
             )
+            logger.error(message)
+            response = UnprocessableEntityResponse(
+                response="Invalid attribute value", cause=message
+            )
+            raise HTTPException(**response.model_dump())
 
 
 def get_rag_toolgroups(

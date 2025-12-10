@@ -4,11 +4,12 @@ PATH_TO_PLANTUML := ~/bin
 # Python registry to where the package should be uploaded
 PYTHON_REGISTRY = pypi
 
+# PyTorch version
+TORCH_VERSION := 2.7.1
+
 
 run: ## Run the service locally
 	uv run src/lightspeed_stack.py
-
-
 
 test-unit: ## Run the unit tests
 	@echo "Running unit tests..."
@@ -23,8 +24,12 @@ test-integration: ## Run integration tests tests
 test-e2e: ## Run end to end tests for the service
 	script -q -e -c "uv run behave --color --format pretty --tags=-skip -D dump_errors=true @tests/e2e/test_list.txt"
 
+test-e2e-local: ## Run end to end tests for the service
+	uv run behave --color --format pretty --tags=-skip -D dump_errors=true @tests/e2e/test_list.txt
+
+
 check-types: ## Checks type hints in sources
-	uv run mypy --explicit-package-bases --disallow-untyped-calls --disallow-untyped-defs --disallow-incomplete-defs --ignore-missing-imports --disable-error-code attr-defined src/ tests/unit
+	uv run mypy --explicit-package-bases --disallow-untyped-calls --disallow-untyped-defs --disallow-incomplete-defs --ignore-missing-imports --disable-error-code attr-defined src/ tests/unit tests/integration tests/e2e/
 
 security-check: ## Check the project for security issues
 	bandit -c pyproject.toml -r src tests
@@ -38,8 +43,11 @@ schema:	## Generate OpenAPI schema file
 
 openapi-doc:	docs/openapi.json scripts/fix_openapi_doc.py	## Generate OpenAPI documentation
 	openapi-to-markdown --input_file docs/openapi.json --output_file output.md
-	python3 scripts/fix_openapi_doc.py <  output.md > docs/output.md
+	python3 scripts/fix_openapi_doc.py <  output.md > docs/openapi.md
 	rm output.md
+
+generate-documentation:	## Generate documentation
+	scripts/gen_doc.py
 
 # TODO uv migration
 requirements.txt:	pyproject.toml pdm.lock ## Generate requirements.txt file containing hashes for all non-devel packages
@@ -99,6 +107,13 @@ distribution-archives:	## Generate distribution archives to be uploaded into Pyt
 
 upload-distribution-archives:	## Upload distribution archives into Python registry
 	uv run python -m twine upload --repository ${PYTHON_REGISTRY} dist/*
+
+konflux-requirements:	## generate hermetic requirements.*.txt file for konflux build
+	uv pip compile pyproject.toml -o requirements.x86_64.txt --generate-hashes --group llslibdev --python-platform x86_64-unknown-linux-gnu --torch-backend cpu  --python-version 3.12
+	uv pip compile pyproject.toml -o requirements.aarch64.txt --generate-hashes --group llslibdev --python-platform aarch64-unknown-linux-gnu --torch-backend cpu --python-version 3.12
+	./scripts/remove_torch_deps.sh requirements.x86_64.txt
+	./scripts/remove_torch_deps.sh requirements.aarch64.txt
+	echo "torch==${TORCH_VERSION}" | uv pip compile  - -o requirements.torch.txt --generate-hashes  --python-version 3.12 --torch-backend cpu --emit-index-url  --no-deps --index-url https://download.pytorch.org/whl/cpu
 
 help: ## Show this help screen
 	@echo 'Usage: make <OPTIONS> ... <TARGETS>'
