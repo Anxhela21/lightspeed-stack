@@ -14,29 +14,17 @@ apis:
       
 benchmarks: []
 conversations_store:
-  db_path: /tmp/conversations.db
+  db_path: ~/.llama/storage/conversations.db
   type: sqlite
 datasets: []
 image_name: starter
 # external_providers_dir: /opt/app-root/src/.llama/providers.d
 inference_store:
-  db_path: /tmp/inference_store.db
+  db_path: ~/.llama/storage/inference-store.db
   type: sqlite
 metadata_store:
-  db_path: /tmp/registry.db
+  db_path: ~/.llama/storage/registry.db
   type: sqlite
-
-models: 
-- model_id: sentence-transformers/all-mpnet-base-v2
-  model_type: embedding
-  provider_id: sentence-transformers
-  provider_model_id: sentence-transformers/all-mpnet-base-v2
-  metadata:
-    embedding_dimension: 768
-# - model_id: gpt-4o-mini
-#   provider_id: openai
-#   model_type: llm
-#   provider_model_id: gpt-4o-mini
 
 providers:
   agents:
@@ -82,14 +70,15 @@ providers:
       metadata_store:
         table_name: files_metadata
         backend: sql_default
-      storage_dir: /tmp/files
+      storage_dir: ~/.llama/storage
     provider_id: meta-reference-files
     provider_type: inline::localfs
   inference:
-  - provider_id: openai
-    provider_type: remote::openai
+  - provider_id: google-vertex
+    provider_type: remote::vertexai
     config:
-      api_key: ${env.OPENAI_API_KEY}
+      project: ${env.VERTEX_AI_PROJECT}
+      location: ${env.VERTEX_AI_LOCATION}
   - config: {}
     provider_id: sentence-transformers
     provider_type: inline::sentence-transformers
@@ -105,11 +94,6 @@ providers:
   - config: {}
     provider_id: llm-as-judge
     provider_type: inline::llm-as-judge
-  # telemetry:
-  # - config:
-  #     service_name: "​"
-  #   provider_id: meta-reference
-  #   provider_type: inline::meta-reference
   tool_runtime:
   - config: {}
     provider_id: rag-runtime
@@ -124,19 +108,14 @@ providers:
 scoring_fns: []
 server:
   port: 8321
-shields: []
-tool_groups:
-- provider_id: rag-runtime
-  toolgroup_id: builtin::rag
-vector_dbs: []
 storage:
   backends:
     kv_default:
       type: kv_sqlite
-      db_path: ${env.SQLITE_STORE_DIR:=~/.llama/distributions/starter}/kv_store.db
+      db_path: ~/.llama/storage/kv_store.db
     sql_default:
       type: sql_sqlite
-      db_path: ${env.SQLITE_STORE_DIR:=~/.llama/distributions/starter}/sql_store.db
+      db_path: ~/.llama/storage/sql_store.db
   stores:
     metadata:
       namespace: registry
@@ -152,4 +131,13 @@ storage:
     prompts:
       namespace: prompts
       backend: kv_default
-
+registered_resources:
+  models: []
+  shields: []
+  vector_dbs: []
+  datasets: []
+  scoring_fns: []
+  benchmarks: []
+  tool_groups:
+  - toolgroup_id: builtin::rag
+    provider_id: rag-runtime

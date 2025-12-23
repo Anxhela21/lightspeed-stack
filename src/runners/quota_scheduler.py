@@ -1,6 +1,6 @@
 """User and cluster quota scheduler runner."""
 
-from typing import Any
+from typing import Any, Optional
 from threading import Thread
 from time import sleep
 
@@ -17,7 +17,8 @@ from quota.connect_pg import connect_pg
 from quota.connect_sqlite import connect_sqlite
 
 from quota.sql import (
-    CREATE_QUOTA_TABLE,
+    CREATE_QUOTA_TABLE_PG,
+    CREATE_QUOTA_TABLE_SQLITE,
     INCREASE_QUOTA_STATEMENT_PG,
     INCREASE_QUOTA_STATEMENT_SQLITE,
     RESET_QUOTA_STATEMENT_PG,
@@ -27,6 +28,7 @@ from quota.sql import (
 logger = get_logger(__name__)
 
 
+# pylint: disable=R0912
 def quota_scheduler(config: QuotaHandlersConfiguration) -> bool:
     """
     Run the quota scheduler loop that applies configured quota limiters periodically.
@@ -54,12 +56,31 @@ def quota_scheduler(config: QuotaHandlersConfiguration) -> bool:
         logger.warning("No limiters are setup, skipping")
         return False
 
-    connection = connect(config)
-    if connection is None:
+    for _ in range(config.scheduler.database_reconnection_count):
+        try:
+            # try to connect to database
+            connection = connect(config)
+            # if connection is established, we are ok
+            if connection is not None:
+                break
+        except Exception as e:  # pylint: disable=broad-exception-caught
+            logger.warning("Can not connect to database, will try later: %s", e)
+        sleep(config.scheduler.database_reconnection_delay)
+    else:
+        # if the connection cannot be established after specified count
+        # attempts, give up
         logger.warning("Can not connect to database, skipping")
         return False
 
-    init_tables(connection)
+    create_quota_table: Optional[str] = None
+    if config.postgres is not None:
+        create_quota_table = CREATE_QUOTA_TABLE_PG
+    elif config.sqlite is not None:
+        create_quota_table = CREATE_QUOTA_TABLE_SQLITE
+
+    if create_quota_table is not None:
+        init_tables(connection, create_quota_table)
+
     period = config.scheduler.period
 
     increase_quota_statement = get_increase_quota_statement(config)
@@ -74,6 +95,16 @@ def quota_scheduler(config: QuotaHandlersConfiguration) -> bool:
         logger.info("Quota scheduler sync started")
         for limiter in config.limiters:
             try:
+                if not connected(connection):
+                    # the old connection might be closed to avoid resource leaks
+                    try:
+                        connection.close()
+                    except Exception:  # pylint: disable=broad-exception-caught
+                        pass  # Connection already dead
+                    connection = connect(config)
+                    if connection is None:
+                        logger.warning("Can not connect to database, skipping")
+                        continue
                 quota_revocation(
                     connection, limiter, increase_quota_statement, reset_quota_statement
                 )
@@ -84,6 +115,30 @@ def quota_scheduler(config: QuotaHandlersConfiguration) -> bool:
     # unreachable code
     connection.close()
     return True
+
+
+def connected(connection: Any) -> bool:
+    """Check if DB is still connected.
+
+    Parameters:
+        connection: Database connection object to verify.
+
+    Returns:
+        bool: True if connection is active, False otherwise.
+    """
+    if connection is None:
+        logger.warning("Not connected, need to reconnect later")
+        return False
+    try:
+        # for compatibility with SQLite it is not possible to use context manager there
+        cursor = connection.cursor()
+        cursor.execute("SELECT 1")
+        cursor.close()
+        logger.info("Connection to storage is ok")
+        return True
+    except Exception as e:  # pylint: disable=broad-exception-caught
+        logger.error("Disconnected from storage: %s", e)
+        return False
 
 
 def get_increase_quota_statement(config: QuotaHandlersConfiguration) -> str:
@@ -296,17 +351,18 @@ def connect(config: QuotaHandlersConfiguration) -> Any:
     return None
 
 
-def init_tables(connection: Any) -> None:
+def init_tables(connection: Any, create_quota_table: str) -> None:
     """
     Create the quota table required by the quota limiter on the provided database connection.
 
     Parameters:
         connection (Any): A DB-API compatible connection on which the quota
                           table(s) will be created; changes are committed before returning.
+        create_quota_table (str): Command used to create table with quota.
     """
     logger.info("Initializing tables for quota limiter")
     cursor = connection.cursor()
-    cursor.execute(CREATE_QUOTA_TABLE)
+    cursor.execute(create_quota_table)
     cursor.close()
     connection.commit()
 

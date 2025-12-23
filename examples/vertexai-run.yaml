@@ -1,91 +1,143 @@
-# Example llama-stack configuration for VertexAI inference
-# 
-# Contributed by @eloycoto (2025-08). See https://github.com/rhdhorchestrator/LS-core-test/blob/master/run-llama-stack.yaml
-# This file shows how to integrate VertexAI with LCS.
-# 
-# Notes:
-# - You will need to configure Gemini inference on VertexAI.
-#
-version: '3'
-image_name: ollama-llama-stack-config
+version: 2
+
 apis:
-  - agents
-  - inference
-  - safety
-  - telemetry
-  - tool_runtime
-  - vector_io
-logging:
-  level: DEBUG  # Set root logger to DEBUG
-  category_levels:
-    llama_stack: DEBUG  # Enable DEBUG for all llama_stack modules
-    llama_stack.providers.remote.inference.vllm: DEBUG
-    llama_stack.providers.inline.agents.meta_reference: DEBUG
-    llama_stack.providers.inline.agents.meta_reference.agent_instance: DEBUG
-    llama_stack.providers.inline.vector_io.faiss: DEBUG
-    llama_stack.providers.inline.telemetry.meta_reference: DEBUG
-    llama_stack.core: DEBUG
-    llama_stack.apis: DEBUG
-    uvicorn: DEBUG
-    uvicorn.access: INFO  # Keep HTTP requests at INFO to reduce noise
-    fastapi: DEBUG
+- agents
+- batches
+- datasetio
+- eval
+- files
+- inference
+- safety
+- scoring
+- tool_runtime
+- vector_io
+      
+benchmarks: []
+conversations_store:
+  db_path: ~/.llama/storage/conversations.db
+  type: sqlite
+datasets: []
+image_name: starter
+# external_providers_dir: /opt/app-root/src/.llama/providers.d
+inference_store:
+  db_path: ~/.llama/storage/inference-store.db
+  type: sqlite
+metadata_store:
+  db_path: ~/.llama/storage/registry.db
+  type: sqlite
 
 providers:
-  vector_io:
-    - config:
-        kvstore:
-          db_path: /tmp/faiss_store.db
-          type: sqlite
-      provider_id: faiss
-      provider_type: inline::faiss
-
   agents:
   - config:
-      persistence_store:
-        db_path: /tmp/agents_store.db
-        namespace: null
-        type: sqlite
-      responses_store:
-        db_path: /tmp/responses_store.db
-        type: sqlite
+      persistence:
+        agent_state:
+          namespace: agents_state
+          backend: kv_default
+        responses:
+          table_name: agents_responses
+          backend: sql_default
     provider_id: meta-reference
     provider_type: inline::meta-reference
-
-
+  batches:
+  - config:
+      kvstore:
+        namespace: batches_store
+        backend: kv_default
+    provider_id: reference
+    provider_type: inline::reference
+  datasetio:
+  - config:
+      kvstore:
+        namespace: huggingface_datasetio
+        backend: kv_default
+    provider_id: huggingface
+    provider_type: remote::huggingface
+  - config:
+      kvstore:
+        namespace: localfs_datasetio
+        backend: kv_default
+    provider_id: localfs
+    provider_type: inline::localfs
+  eval:
+  - config:
+      kvstore:
+        namespace: eval_store
+        backend: kv_default
+    provider_id: meta-reference
+    provider_type: inline::meta-reference
+  files:
+  - config:
+      metadata_store:
+        table_name: files_metadata
+        backend: sql_default
+      storage_dir: ~/.llama/storage
+    provider_id: meta-reference-files
+    provider_type: inline::localfs
   inference:
-    - provider_id: vllm-inference
-      provider_type: remote::vllm
-      config:
-        url: ${env.VLLM_URL:=http://localhost:8000/v1}
-        max_tokens: ${env.VLLM_MAX_TOKENS:=4096}
-        api_token: ${env.VLLM_API_TOKEN:=fake}
-        tls_verify: ${env.VLLM_TLS_VERIFY:=false}
-
-    - provider_id: google-vertex
-      provider_type: remote::vertexai
-      config:
-        project: ${env.VERTEXAI_PROJECT}
-        region: ${env.VERTEXAI_REGION:=us-east5}
-
+  - provider_id: google-vertex
+    provider_type: remote::vertexai
+    config:
+      project: ${env.VERTEX_AI_PROJECT}
+      location: ${env.VERTEX_AI_LOCATION}
+  - config: {}
+    provider_id: sentence-transformers
+    provider_type: inline::sentence-transformers
+  safety:
+  - config:
+      excluded_categories: []
+    provider_id: llama-guard
+    provider_type: inline::llama-guard
+  scoring:
+  - config: {}
+    provider_id: basic
+    provider_type: inline::basic
+  - config: {}
+    provider_id: llm-as-judge
+    provider_type: inline::llm-as-judge
   tool_runtime:
-    - provider_id: model-context-protocol
-      provider_type: remote::model-context-protocol
-      config: {}
-      module: null
-
-  telemetry:
-    - config:
-        service_name: 'llama-stack'
-        sinks: console,sqlite
-        sqlite_db_path: /tmp/trace_store.db
-      provider_id: meta-reference
-      provider_type: inline::meta-reference
-
-metadata_store:
-  type: sqlite
-  db_path: /tmp/registry.db
-  namespace: null
-
-inference_store:
-  type: sqlite
-  db_path: /tmp/inference_store.db
+  - config: {}
+    provider_id: rag-runtime
+    provider_type: inline::rag-runtime
+  vector_io:
+  - config:
+      persistence:
+        namespace: faiss_store
+        backend: kv_default
+    provider_id: faiss
+    provider_type: inline::faiss
+scoring_fns: []
+server:
+  port: 8321
+storage:
+  backends:
+    kv_default:
+      type: kv_sqlite
+      db_path: ~/.llama/storage/kv_store.db
+    sql_default:
+      type: sql_sqlite
+      db_path: ~/.llama/storage/sql_store.db
+  stores:
+    metadata:
+      namespace: registry
+      backend: kv_default
+    inference:
+      table_name: inference_store
+      backend: sql_default
+      max_write_queue_size: 10000
+      num_writers: 4
+    conversations:
+      table_name: openai_conversations
+      backend: sql_default
+    prompts:
+      namespace: prompts
+      backend: kv_default
+registered_resources:
+  models: []
+  shields: []
+  vector_dbs: []
+  datasets: []
+  scoring_fns: []
+  benchmarks: []
+  tool_groups:
+  - toolgroup_id: builtin::rag
+    provider_id: rag-runtime

@@ -439,14 +439,12 @@ async def retrieve_response(  # pylint: disable=too-many-locals,too-many-branche
             conversation_id,
         )
 
-    # Normalize conversation ID before returning (remove conv_ prefix for consistency)
-    normalized_conversation_id = (
-        normalize_conversation_id(conversation_id)
-        if conversation_id
-        else conversation_id
+    return (
+        summary,
+        normalize_conversation_id(conversation_id),
+        referenced_documents,
+        token_usage,
     )
-
-    return (summary, normalized_conversation_id, referenced_documents, token_usage)
 
 
 def parse_referenced_documents_from_responses_api(
@@ -743,10 +741,13 @@ async def prepare_tools_for_responses_api(
         return None
 
     toolgroups = []
-    # Get vector stores for RAG tools
-    vector_store_ids = [
-        vector_store.id for vector_store in (await client.vector_stores.list()).data
-    ]
+    # Get vector stores for RAG tools - use specified ones or fetch all
+    if query_request.vector_store_ids:
+        vector_store_ids = query_request.vector_store_ids
+    else:
+        vector_store_ids = [
+            vector_store.id for vector_store in (await client.vector_stores.list()).data
+        ]
 
     # Add RAG tools if vector stores are available
     rag_tools = get_rag_tools(vector_store_ids)
