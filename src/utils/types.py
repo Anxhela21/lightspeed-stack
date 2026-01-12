@@ -1,15 +1,26 @@
 """Common types for the project."""
 
-from typing import Any, Optional
+from typing import Any, Optional, TYPE_CHECKING
 import json
-from llama_stack_client.lib.agents.event_logger import interleaved_content_as_str
+
+# interleaved_content_as_str was removed from newer llama_stack_client versions
+# We'll use our own implementation based on content_to_str
 from llama_stack_client.lib.agents.tool_parser import ToolParser
 from llama_stack_client.types.shared.completion_message import CompletionMessage
 from llama_stack_client.types.shared.tool_call import ToolCall
-from llama_stack_client.types.tool_execution_step import ToolExecutionStep
-from pydantic import BaseModel
-from models.responses import RAGChunk
+
+# ToolExecutionStep was removed in newer llama_stack_client versions
+# Make import optional for backward compatibility
+try:
+    from llama_stack_client.types.tool_execution_step import ToolExecutionStep
+except ImportError:
+    # Create a minimal mock for type hinting when the actual type is not available
+    ToolExecutionStep = type("ToolExecutionStep", (), {})
+from pydantic import BaseModel, Field
 from constants import DEFAULT_RAG_TOOL
+
+if TYPE_CHECKING:
+    from models.responses import RAGChunk
 
 
 def content_to_str(content: Any) -> str:
@@ -27,13 +38,28 @@ def content_to_str(content: Any) -> str:
     if isinstance(content, str):
         return content
     # Handle content items if they exist
-    if hasattr(content, 'text'):
+    if hasattr(content, "text"):
         return content.text
-    if hasattr(content, 'image'):
+    if hasattr(content, "image"):
         return "<image>"
     if isinstance(content, list):
         return " ".join(content_to_str(item) for item in content)
     return str(content)
+
+
+def interleaved_content_as_str(content: Any) -> str:
+    """Convert interleaved content to string format.
+
+    This is a replacement for the removed llama_stack_client function.
+    Converts interleaved content (text/images/lists) to a string representation.
+
+    Parameters:
+        content: The interleaved content to convert
+
+    Returns:
+        str: String representation of the content
+    """
+    return content_to_str(content)
 
 
 class Singleton(type):
@@ -132,12 +158,7 @@ class ToolResultSummary(BaseModel):
     round: int = Field(..., description="Round number or step of tool execution")
 
 
-class RAGChunk(BaseModel):
-    """Model representing a RAG chunk used in the response."""
-
-    content: str = Field(description="The content of the chunk")
-    source: Optional[str] = Field(None, description="Source document or URL")
-    score: Optional[float] = Field(None, description="Relevance score")
+# RAGChunk is imported from models.responses - no need to redefine
 
 
 class TurnSummary(BaseModel):
@@ -145,7 +166,7 @@ class TurnSummary(BaseModel):
 
     llm_response: str
     tool_calls: list[ToolCallSummary]
-    rag_chunks: list[RAGChunk] = []
+    rag_chunks: list["RAGChunk"] = []
 
     def append_tool_calls_from_llama(self, tec: ToolExecutionStep) -> None:
         """
@@ -173,9 +194,7 @@ class TurnSummary(BaseModel):
         responses_by_id = {tc.call_id: tc for tc in tec.tool_responses}
         for call_id, tc in calls_by_id.items():
             resp = responses_by_id.get(call_id)
-            response_content = (
-                interleaved_content_as_str(resp.content) if resp else None
-            )
+            response_content = content_to_str(resp.content) if resp else None
 
             self.tool_calls.append(
                 ToolCallSummary(

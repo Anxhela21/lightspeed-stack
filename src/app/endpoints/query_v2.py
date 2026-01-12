@@ -27,6 +27,7 @@ from models.responses import (
     NotFoundResponse,
     QueryResponse,
     QuotaExceededResponse,
+    RAGChunk,
     ReferencedDocument,
     ServiceUnavailableResponse,
     UnauthorizedResponse,
@@ -45,7 +46,7 @@ from utils.shields import (
 )
 from utils.suid import normalize_conversation_id, to_llama_stack_conversation_id
 from utils.token_counter import TokenCounter
-from utils.types import RAGChunk, ToolCallSummary, ToolResultSummary, TurnSummary
+from utils.types import ToolCallSummary, TurnSummary
 
 logger = logging.getLogger("app.endpoints.handlers")
 router = APIRouter(tags=["query_v2"])
@@ -315,6 +316,9 @@ async def retrieve_response(  # pylint: disable=too-many-locals,too-many-branche
         client, query_request, token, configuration, mcp_headers
     )
 
+    # Query vector_io directly for Solr and other vector IO providers
+    vector_io_rag_chunks = await query_vector_io_for_rag_chunks(client, query_request)
+
     # Prepare input for Responses API
     # Convert attachments to text and concatenate with query
     input_text = query_request.query
@@ -325,7 +329,15 @@ async def retrieve_response(  # pylint: disable=too-many-locals,too-many-branche
                 f"\n\n[Attachment: {attachment.attachment_type}]\n{attachment.content}"
             )
 
-<<<<<<< HEAD
+    # Inject vector_io RAG chunks as context if available
+    if vector_io_rag_chunks:
+        rag_context_text = format_rag_context_for_input(vector_io_rag_chunks)
+        if rag_context_text:
+            input_text += f"\n\n[Context from Vector Database]\n{rag_context_text}"
+            logger.debug(
+                "Added %d vector_io RAG chunks as context", len(vector_io_rag_chunks)
+            )
+
     # Handle conversation ID for Responses API
     # Create conversation upfront if not provided
     conversation_id = query_request.conversation_id
@@ -367,8 +379,6 @@ async def retrieve_response(  # pylint: disable=too-many-locals,too-many-branche
             TokenCounter(),
         )
 
-=======
->>>>>>> c971439 (Streaming query feature)
     # Create OpenAI response using responses API
     create_kwargs: dict[str, Any] = {
         "input": input_text,
@@ -412,17 +422,17 @@ async def retrieve_response(  # pylint: disable=too-many-locals,too-many-branche
         len(llm_response),
     )
 
-    # Extract rag chunks
-    rag_chunks = parse_rag_chunks_from_responses_api(response)
+    # Extract rag chunks from Responses API (file_search results)
+    response_rag_chunks = parse_rag_chunks_from_responses_api(response)
+
+    # Combine vector_io RAG chunks with response RAG chunks
+    all_rag_chunks = vector_io_rag_chunks + response_rag_chunks
 
     summary = TurnSummary(
         llm_response=llm_response,
         tool_calls=tool_calls,
-<<<<<<< HEAD
-        tool_results=tool_results,
-        rag_chunks=rag_chunks,
-=======
->>>>>>> c971439 (Streaming query feature)
+        tool_results=[],
+        rag_chunks=all_rag_chunks,
     )
 
     # Extract referenced documents and token usage from Responses API response
@@ -437,7 +447,6 @@ async def retrieve_response(  # pylint: disable=too-many-locals,too-many-branche
             "Response lacks content (conversation_id=%s)",
             conversation_id,
         )
-<<<<<<< HEAD
 
     return (
         summary,
@@ -473,9 +482,6 @@ def parse_rag_chunks_from_responses_api(response_obj: Any) -> list[RAGChunk]:
                 rag_chunks.append(rag_chunk)
 
     return rag_chunks
-=======
-    return (summary, conversation_id, referenced_documents, token_usage)
->>>>>>> c971439 (Streaming query feature)
 
 
 def parse_referenced_documents_from_responses_api(
@@ -665,6 +671,149 @@ def get_mcp_tools(
     return tools
 
 
+async def get_vector_io_tools(
+    client: AsyncLlamaStackClient,
+    query_request: QueryRequest,
+) -> list[dict[str, Any]]:
+    """
+    Get vector IO tools for direct vector_io querying with Solr support.
+
+    Args:
+        client: The Llama Stack client instance
+        query_request: The user's query request containing vector DB and Solr parameters
+
+    Returns:
+        list[dict[str, Any]]: Empty list for now, as vector_io querying is handled directly
+    """
+    # The Responses API doesn't have native vector_io tool support yet,
+    # so we handle vector_io querying directly in retrieve_response function
+    return []
+
+
+async def query_vector_io_for_rag_chunks(
+    client: AsyncLlamaStackClient,
+    query_request: QueryRequest,
+) -> list[RAGChunk]:
+    """
+    Query vector_io directly for RAG chunks, especially for Solr-based providers.
+
+    This function replicates the vector_io querying logic from the v1 endpoint
+    to support Solr filtering and other vector IO providers in the v2 endpoint.
+
+    Args:
+        client: The Llama Stack client instance
+        query_request: The user's query request containing vector DB and Solr parameters
+
+    Returns:
+        list[RAGChunk]: List of RAG chunks retrieved from vector_io
+    """
+    rag_chunks = []
+
+    try:
+        # Get available vector DBs
+        try:
+            vector_dbs_response = await client.vector_dbs.list()
+            vector_db_ids = [
+                vector_db.identifier for vector_db in vector_dbs_response.data
+            ]
+        except Exception:
+            # Fallback to newer vector_stores API if vector_dbs is not available
+            try:
+                vector_stores_response = await client.vector_stores.list()
+                vector_db_ids = [
+                    vector_store.id for vector_store in vector_stores_response.data
+                ]
+            except Exception as e:
+                logger.warning("Could not fetch vector stores/dbs: %s", e)
+                return []
+
+        if not vector_db_ids:
+            logger.debug("No vector DBs available for vector_io querying")
+            return []
+
+        # Use the first available vector DB (following v1 logic)
+        vector_db_id = vector_db_ids[0]
+        logger.debug("Using vector DB ID for vector_io query: %s", vector_db_id)
+
+        # Prepare parameters for vector_io query
+        params = {"k": 5, "score_threshold": 0.0}
+        logger.debug("Initial vector_io params: %s", params)
+
+        # Add Solr-specific parameters if provided
+        if query_request.solr:
+            params["solr"] = query_request.solr
+            logger.debug("Added Solr parameters: %s", query_request.solr)
+
+        logger.debug("Final params for vector_io.query: %s", params)
+
+        # Execute vector_io query
+        query_response = await client.vector_io.query(
+            vector_db_id=vector_db_id, query=query_request.query, params=params
+        )
+
+        logger.debug("Vector IO query response: %s", query_response)
+
+        if query_response.chunks:
+            retrieved_chunks = query_response.chunks
+            retrieved_scores = (
+                query_response.scores if hasattr(query_response, "scores") else []
+            )
+
+            # Convert to RAGChunk format
+            for i, chunk in enumerate(retrieved_chunks):
+                # Extract source from chunk metadata
+                source = None
+                if chunk.metadata:
+                    # Check for reference_url first, then parent_id
+                    source = chunk.metadata.get("reference_url")
+                    if not source:
+                        parent_id = chunk.metadata.get("parent_id")
+                        if parent_id:
+                            # Build source URL for offline mode compatibility
+                            source = f"https://mimir.corp.redhat.com{parent_id}"
+
+                # Get score from retrieved_scores list if available
+                score = retrieved_scores[i] if i < len(retrieved_scores) else None
+
+                rag_chunks.append(
+                    RAGChunk(
+                        content=chunk.content,
+                        source=source,
+                        score=score,
+                    )
+                )
+
+            logger.info("Retrieved %d chunks from vector_io", len(rag_chunks))
+        else:
+            logger.debug("No chunks returned from vector_io query")
+
+    except Exception as e:
+        logger.warning("Failed to query vector_io for RAG chunks: %s", e)
+        # Continue without vector_io chunks
+
+    return rag_chunks
+
+
+def format_rag_context_for_input(rag_chunks: list[RAGChunk]) -> str:
+    """
+    Format RAG chunks into context text for injection into the input.
+
+    Args:
+        rag_chunks: List of RAG chunks to format
+
+    Returns:
+        str: Formatted context text ready for injection
+    """
+    if not rag_chunks:
+        return ""
+
+    context_parts = []
+    for i, chunk in enumerate(rag_chunks[:5], 1):  # Limit to top 5 chunks
+        context_parts.append(f"Context {i}: {chunk.content}")
+
+    return "\n\n".join(context_parts)
+
+
 async def prepare_tools_for_responses_api(
     client: AsyncLlamaStackClient,
     query_request: QueryRequest,
@@ -673,10 +822,11 @@ async def prepare_tools_for_responses_api(
     mcp_headers: dict[str, dict[str, str]] | None = None,
 ) -> list[dict[str, Any]] | None:
     """
-    Prepare tools for Responses API including RAG and MCP tools.
+    Prepare tools for Responses API including RAG, Vector IO, and MCP tools.
 
     This function retrieves vector stores and combines them with MCP
     server tools to create a unified toolgroups list for the Responses API.
+    It also supports direct vector_io querying for Solr and other vector IO providers.
 
     Args:
         client: The Llama Stack client instance
@@ -693,6 +843,7 @@ async def prepare_tools_for_responses_api(
         return None
 
     toolgroups = []
+
     # Get vector stores for RAG tools - use specified ones or fetch all
     if query_request.vector_store_ids:
         vector_store_ids = query_request.vector_store_ids
@@ -706,6 +857,12 @@ async def prepare_tools_for_responses_api(
     if rag_tools:
         toolgroups.extend(rag_tools)
 
+    # Add Vector IO tools if available (for Solr and other vector IO providers)
+    vector_io_tools = await get_vector_io_tools(client, query_request)
+    if vector_io_tools:
+        toolgroups.extend(vector_io_tools)
+        logger.debug("Configured %d Vector IO tools", len(vector_io_tools))
+
     # Add MCP server tools
     mcp_tools = get_mcp_tools(config.mcp_servers, token, mcp_headers)
     if mcp_tools:
@@ -715,6 +872,7 @@ async def prepare_tools_for_responses_api(
             len(mcp_tools),
             [tool.get("server_label", "unknown") for tool in mcp_tools],
         )
+
     # Convert empty list to None for consistency with existing behavior
     if not toolgroups:
         return None

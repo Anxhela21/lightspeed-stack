@@ -11,24 +11,28 @@ from urllib.parse import urljoin
 
 from fastapi import APIRouter, Depends, HTTPException, Request
 from litellm.exceptions import RateLimitError
-from pydantic import ValidationError
 from llama_stack_client import (
     APIConnectionError,
-    APIStatusError,
     AsyncLlamaStackClient,
     RateLimitError as LlamaStackRateLimitError,  # type: ignore
 )
-from llama_stack_client.lib.agents.event_logger import interleaved_content_as_str
+
+# Import our own implementation since it was removed from llama_stack_client
 from llama_stack_client.types import Shield, UserMessage  # type: ignore
-from llama_stack_client.types.agents.turn import Turn
-from llama_stack_client.types.agents.turn_create_params import (
+from llama_stack_client.types.alpha.agents.turn import Turn
+from llama_stack_client.types.alpha.agents.turn_create_params import (
     Document,
     Toolgroup,
     ToolgroupAgentToolGroupWithArgs,
 )
 from llama_stack_client.types.model_list_response import ModelListResponse
 from llama_stack_client.types.shared.interleaved_content_item import TextContentItem
-from llama_stack_client.types.tool_execution_step import ToolExecutionStep
+
+# ToolExecutionStep was removed in newer llama_stack_client versions
+try:
+    from llama_stack_client.types.tool_execution_step import ToolExecutionStep
+except ImportError:
+    ToolExecutionStep = type("ToolExecutionStep", (), {})
 from sqlalchemy.exc import SQLAlchemyError
 
 import constants
@@ -74,7 +78,7 @@ from utils.quota import (
 from utils.suid import normalize_conversation_id
 from utils.token_counter import TokenCounter, extract_and_update_token_metrics
 from utils.transcripts import store_transcript
-from utils.types import TurnSummary
+from utils.types import TurnSummary, interleaved_content_as_str
 
 logger = logging.getLogger("app.endpoints.handlers")
 router = APIRouter(tags=["query"])
@@ -783,7 +787,7 @@ async def retrieve_response(  # pylint: disable=too-many-locals,too-many-branche
                 # Fallback to vector_dbs (old API)
                 vector_dbs = await client.vector_dbs.list()
                 vector_db_ids = [vdb.identifier for vdb in vector_dbs]
-        
+
         mcp_toolgroups = [mcp_server.name for mcp_server in configuration.mcp_servers]
 
         toolgroups = None

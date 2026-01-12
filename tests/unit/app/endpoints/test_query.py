@@ -11,7 +11,9 @@ import pytest
 from fastapi import HTTPException, Request, status
 import httpx
 from litellm.exceptions import RateLimitError
-from llama_stack_client import APIConnectionError, RateLimitError as LlamaStackRateLimitError
+from llama_stack_client import (
+    APIConnectionError,
+)
 from llama_stack_client.types import UserMessage
 from llama_stack_client.types.agents.turn import Turn
 from llama_stack_client.types.shared.interleaved_content_item import TextContentItem

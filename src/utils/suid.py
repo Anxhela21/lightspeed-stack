@@ -57,24 +57,30 @@ def check_suid(suid: str) -> bool:
 def normalize_conversation_id(conversation_id: str) -> str:
     """
     Normalize conversation ID by stripping 'conv_' prefix if present.
-    
+
     Args:
         conversation_id: The conversation ID to normalize
-        
+
     Returns:
         str: The normalized conversation ID without 'conv_' prefix
     """
-    return conversation_id[5:] if conversation_id.startswith("conv_") else conversation_id
+    return (
+        conversation_id[5:] if conversation_id.startswith("conv_") else conversation_id
+    )
 
 
 def to_llama_stack_conversation_id(conversation_id: str) -> str:
     """
     Convert a normalized conversation ID to llama-stack format with 'conv_' prefix.
-    
+
     Args:
         conversation_id: The conversation ID to convert
-        
+
     Returns:
         str: The conversation ID with 'conv_' prefix
     """
-    return f"conv_{conversation_id}" if not conversation_id.startswith("conv_") else conversation_id
+    return (
+        f"conv_{conversation_id}"
+        if not conversation_id.startswith("conv_")
+        else conversation_id
+    )

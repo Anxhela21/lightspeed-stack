@@ -700,6 +700,9 @@ class Action(str, Enum):
     A2A_MESSAGE = "a2a_message"
     A2A_JSONRPC = "a2a_jsonrpc"
 
+    # RHEL Lightspeed rlsapi v1 endpoints
+    RLSAPI_V1_INFER = "rlsapi_v1_infer"
+
 
 class AccessRule(ConfigurationBase):
     """Rule defining what actions a role can perform."""

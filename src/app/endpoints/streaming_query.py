@@ -18,12 +18,13 @@ from llama_stack_client import (
     AsyncLlamaStackClient,
     RateLimitError,  # type: ignore
 )
-from llama_stack_client.lib.agents.event_logger import interleaved_content_as_str
+
+# Import our own implementation since it was removed from llama_stack_client
 from llama_stack_client.types import UserMessage  # type: ignore
-from llama_stack_client.types.agents.agent_turn_response_stream_chunk import (
+from llama_stack_client.types.alpha.agents.agent_turn_response_stream_chunk import (
     AgentTurnResponseStreamChunk,
 )
-from llama_stack_client.types.agents.turn_create_params import Document
+from llama_stack_client.types.alpha.agents.turn_create_params import Document
 from llama_stack_client.types.shared import ToolCall
 from llama_stack_client.types.shared.interleaved_content_item import TextContentItem
 
@@ -73,7 +74,7 @@ from utils.endpoints import (
 from utils.mcp_headers import handle_mcp_headers_with_toolgroups, mcp_headers_dependency
 from utils.token_counter import TokenCounter, extract_token_usage_from_turn
 from utils.transcripts import store_transcript
-from utils.types import TurnSummary
+from utils.types import TurnSummary, interleaved_content_as_str
 
 logger = logging.getLogger("app.endpoints.handlers")
 router = APIRouter(tags=["streaming_query"])
@@ -747,9 +748,9 @@ def create_agent_response_generator(  # pylint: disable=too-many-locals
         """
         chunk_id = 0
         summary = TurnSummary(
-            llm_response="No response from the model", 
-            tool_calls=[], 
-            rag_chunks=getattr(context, 'vector_io_rag_chunks', None) or []
+            llm_response="No response from the model",
+            tool_calls=[],
+            rag_chunks=getattr(context, "vector_io_rag_chunks", None) or [],
         )
 
         # Determine media type for response formatting
@@ -797,8 +798,14 @@ def create_agent_response_generator(  # pylint: disable=too-many-locals
             else TokenCounter()
         )
 
-        vector_io_referenced_docs = getattr(context, 'vector_io_referenced_docs', None)
-        yield stream_end_event(context.metadata_map, summary, token_usage, media_type, vector_io_referenced_docs)
+        vector_io_referenced_docs = getattr(context, "vector_io_referenced_docs", None)
+        yield stream_end_event(
+            context.metadata_map,
+            summary,
+            token_usage,
+            media_type,
+            vector_io_referenced_docs,
+        )
 
         # Perform cleanup tasks (database and cache operations)
         await cleanup_after_streaming(
@@ -923,11 +930,11 @@ async def streaming_query_endpoint_handler_base(  # pylint: disable=too-many-loc
             client=client,
             metadata_map=metadata_map,
         )
-        
+
         # Add vector_io data to context if available
-        if hasattr(context, 'vector_io_rag_chunks'):
+        if hasattr(context, "vector_io_rag_chunks"):
             context.vector_io_rag_chunks = vector_io_rag_chunks
-        if hasattr(context, 'vector_io_referenced_docs'):
+        if hasattr(context, "vector_io_referenced_docs"):
             context.vector_io_referenced_docs = vector_io_referenced_docs
 
         # Create the response generator using the provided factory function
@@ -1234,7 +1241,7 @@ async def retrieve_response(
                 # Fallback to vector_dbs (old API)
                 vector_dbs = await client.vector_dbs.list()
                 vector_db_ids = [vdb.identifier for vdb in vector_dbs]
-        
+
         mcp_toolgroups = [mcp_server.name for mcp_server in configuration.mcp_servers]
 
         toolgroups = None

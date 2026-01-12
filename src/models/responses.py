@@ -10,6 +10,7 @@ from pydantic_core import SchemaError
 
 from quota.quota_exceed_error import QuotaExceedError
 from models.config import Action, Configuration
+from utils.types import ToolCallSummary, ToolResultSummary
 
 BAD_REQUEST_DESCRIPTION = "Invalid request format"
 UNAUTHORIZED_DESCRIPTION = "Unauthorized"
@@ -331,13 +332,9 @@ class ReferencedDocument(BaseModel):
         doc_title: Title of the referenced doc.
     """
 
-<<<<<<< HEAD
-    doc_url: Optional[AnyUrl] = Field(
+    doc_url: AnyUrl | str | None = Field(
         None, description="URL of the referenced document"
     )
-=======
-    doc_url: AnyUrl | str | None = Field(None, description="URL of the referenced document")
->>>>>>> c971439 (Streaming query feature)
 
     doc_title: Optional[str] = Field(
         None, description="Title of the referenced document"
@@ -420,7 +417,6 @@ class QueryResponse(AbstractSuccessfulResponse):
         examples=[{"daily": 1000, "monthly": 50000}],
     )
 
-<<<<<<< HEAD
     tool_calls: Optional[list[ToolCallSummary]] = Field(
         None,
         description="List of tool calls made during response generation",
@@ -430,9 +426,6 @@ class QueryResponse(AbstractSuccessfulResponse):
         None,
         description="List of tool results",
     )
-
-=======
->>>>>>> c971439 (Streaming query feature)
     model_config = {
         "json_schema_extra": {
             "examples": [

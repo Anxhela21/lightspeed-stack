@@ -458,16 +458,19 @@ def test_insert_and_get_with_referenced_documents(tmpdir: Path) -> None:
     # Check referenced documents - URLs may be strings after serialization
     assert retrieved_entry.referenced_documents is not None
     assert entry_with_docs.referenced_documents is not None
-    assert len(retrieved_entry.referenced_documents) == len(entry_with_docs.referenced_documents)
-    # pylint: disable-next=unsubscriptable-object
-    assert (
-        str(retrieved_entry.referenced_documents[0].doc_url)
-        == str(entry_with_docs.referenced_documents[0].doc_url)  # pylint: disable=unsubscriptable-object
+    assert len(retrieved_entry.referenced_documents) == len(
+        entry_with_docs.referenced_documents
     )
+    # pylint: disable-next=unsubscriptable-object
+    assert str(retrieved_entry.referenced_documents[0].doc_url) == str(
+        entry_with_docs.referenced_documents[0].doc_url
+    )  # pylint: disable=unsubscriptable-object
     # pylint: disable-next=unsubscriptable-object
     assert (
         retrieved_entry.referenced_documents[0].doc_title
-        == entry_with_docs.referenced_documents[0].doc_title  # pylint: disable=unsubscriptable-object
+        == entry_with_docs.referenced_documents[
+            0
+        ].doc_title  # pylint: disable=unsubscriptable-object
     )
     assert retrieved_entries[0].referenced_documents is not None
     assert retrieved_entries[0].referenced_documents[0].doc_title == "Test Doc"

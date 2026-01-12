@@ -25,6 +25,7 @@ from app.endpoints.query import (
 from app.endpoints.query_v2 import (
     extract_token_usage_from_responses_api,
     get_topic_summary,
+    parse_referenced_documents_from_responses_api,
     prepare_tools_for_responses_api,
 )
 from app.endpoints.streaming_query import (
@@ -57,9 +58,12 @@ from utils.endpoints import (
 from utils.mcp_headers import mcp_headers_dependency
 from utils.shields import (
     append_turn_to_conversation,
+    detect_shield_violations,
     run_shield_moderation,
 )
 from utils.token_counter import TokenCounter
+from utils.quota import consume_tokens, get_available_quotas
+from utils.suid import normalize_conversation_id, to_llama_stack_conversation_id
 from utils.transcripts import store_transcript
 from utils.types import ToolCallSummary, TurnSummary
 
@@ -257,15 +261,11 @@ def create_responses_response_generator(  # pylint: disable=too-many-locals,too-
                 # Capture the response object for token usage extraction
                 latest_response_object = getattr(chunk, "response", None)
 
-<<<<<<< HEAD
-=======
                 # Check for shield violations in the completed response
                 if latest_response_object:
                     detect_shield_violations(
                         getattr(latest_response_object, "output", [])
                     )
-
->>>>>>> c971439 (Streaming query feature)
                 if not emitted_turn_complete:
                     final_message = summary.llm_response or "".join(text_parts)
                     if not final_message:
@@ -299,7 +299,8 @@ def create_responses_response_generator(  # pylint: disable=too-many-locals,too-
             if latest_response_object is not None
             else TokenCounter()
         )
-<<<<<<< HEAD
+
+        # Consume tokens for quota tracking
         consume_tokens(
             configuration.quota_limiters,
             configuration.token_usage_history,
@@ -309,12 +310,17 @@ def create_responses_response_generator(  # pylint: disable=too-many-locals,too-
             model_id=context.model_id,
             provider_id=context.provider_id,
         )
+
+        # Parse referenced documents from the response
         referenced_documents = parse_referenced_documents_from_responses_api(
             cast(OpenAIResponseObject, latest_response_object)
         )
+
+        # Get available quotas for the user
         available_quotas = get_available_quotas(
             configuration.quota_limiters, context.user_id
         )
+
         yield stream_end_event(
             context.metadata_map,
             token_usage,
@@ -322,10 +328,6 @@ def create_responses_response_generator(  # pylint: disable=too-many-locals,too-
             referenced_documents,
             media_type,
         )
-=======
->>>>>>> c971439 (Streaming query feature)
-
-        yield stream_end_event(context.metadata_map, summary, token_usage, media_type)
 
         # Perform cleanup tasks (database and cache operations)
         await cleanup_after_streaming(
@@ -437,7 +439,6 @@ async def retrieve_response(
                 f"{attachment.content}"
             )
 
-<<<<<<< HEAD
     # Handle conversation ID for Responses API
     # Create conversation upfront if not provided
     conversation_id = query_request.conversation_id
@@ -470,8 +471,6 @@ async def retrieve_response(
             normalize_conversation_id(conversation_id),
         )
 
-=======
->>>>>>> c971439 (Streaming query feature)
     create_params: dict[str, Any] = {
         "input": input_text,
         "model": model_id,
@@ -486,7 +485,6 @@ async def retrieve_response(
     response = await client.responses.create(**create_params)
     response_stream = cast(AsyncIterator[OpenAIResponseObjectStream], response)
 
-<<<<<<< HEAD
     return response_stream, normalize_conversation_id(conversation_id)
 
 
@@ -539,8 +537,3 @@ async def create_violation_stream(
             status="completed",
         )
     )
-=======
-    # For streaming responses, the ID arrives in the first 'response.created' chunk
-    # Return empty conversation_id here; it will be set once the first chunk is received
-    return response_stream, ""
->>>>>>> c971439 (Streaming query feature)
