@@ -59,6 +59,11 @@ logger = logging.getLogger("app.endpoints.handlers")
 router = APIRouter(tags=["query"])
 
 
+# When OFFLINE is False, use reference_url for chunk source
+# When OFFLINE is True, use parent_id for chunk source
+# TODO: move this setting to a higher level configuration
+OFFLINE = True
+
 query_response: dict[int | str, dict[str, Any]] = {
     200: QueryResponse.openapi_response(),
     401: UnauthorizedResponse.openapi_response(
@@ -390,9 +395,9 @@ async def query_endpoint_handler_base(  # pylint: disable=R0914
         response = QueryResponse(
             conversation_id=conversation_id,
             response=summary.llm_response,
-            tool_calls=summary.tool_calls,
-            tool_results=summary.tool_results,
-            rag_chunks=summary.rag_chunks,
+            rag_chunks=rag_chunks_dict,
+            tool_calls=summary.tool_calls if summary.tool_calls else [],
+            tool_results=summary.tool_results if summary.tool_results else [],
             referenced_documents=referenced_documents,
             truncated=False,  # TODO: implement truncation detection
             input_tokens=token_usage.input_tokens,
@@ -586,6 +591,311 @@ def parse_metadata_from_text_item(
     return None
 
 
+# def parse_referenced_documents(response: Turn) -> list[ReferencedDocument]:
+#     """
+#     Parse referenced documents from Turn.
+
+#     Iterate through the steps of a response and collect all referenced
+#     documents from rag tool responses.
+
+#     Args:
+#         response(Turn): The response object from the agent turn.
+
+#     Returns:
+#         list[ReferencedDocument]: A list of ReferencedDocument, each with 'doc_url' and 'doc_title'
+#         representing all referenced documents found in the response.
+#     """
+#     docs = []
+#     for step in response.steps:
+#         if not isinstance(step, ToolExecutionStep):
+#             continue
+#         for tool_response in step.tool_responses:
+#             if tool_response.tool_name != constants.DEFAULT_RAG_TOOL:
+#                 continue
+#             for text_item in tool_response.content:
+#                 if not isinstance(text_item, TextContentItem):
+#                     continue
+#                 doc = parse_metadata_from_text_item(text_item)
+#                 if doc:
+#                     docs.append(doc)
+#     return docs
+
+
+# async def retrieve_response(  # pylint: disable=too-many-locals,too-many-branches,too-many-arguments
+#     client: AsyncLlamaStackClient,
+#     model_id: str,
+#     query_request: QueryRequest,
+#     token: str,
+#     mcp_headers: Optional[dict[str, dict[str, str]]] = None,
+#     *,
+#     provider_id: str = "",
+# ) -> tuple[TurnSummary, str, list[ReferencedDocument], TokenCounter]:
+#     """
+#     Retrieve response from LLMs and agents.
+
+#     Retrieves a response from the Llama Stack LLM or agent for a
+#     given query, handling shield configuration, tool usage, and
+#     attachment validation.
+
+#     This function configures input/output shields, system prompts,
+#     and toolgroups (including RAG and MCP integration) as needed
+#     based on the query request and system configuration. It
+#     validates attachments, manages conversation and session
+#     context, and processes MCP headers for multi-component
+#     processing. Shield violations in the response are detected and
+#     corresponding metrics are updated.
+
+#     Parameters:
+#         model_id (str): The identifier of the LLM model to use.
+#         provider_id (str): The identifier of the LLM provider to use.
+#         query_request (QueryRequest): The user's query and associated metadata.
+#         token (str): The authentication token for authorization.
+#         mcp_headers (dict[str, dict[str, str]], optional): Headers for multi-component processing.
+
+#     Returns:
+#         tuple[TurnSummary, str, list[ReferencedDocument], TokenCounter]: A tuple containing
+#         a summary of the LLM or agent's response
+#         content, the conversation ID, the list of parsed referenced documents, and token usage information.
+#     """
+#     available_input_shields = [
+#         shield.identifier
+#         for shield in filter(is_input_shield, await client.shields.list())
+#     ]
+#     available_output_shields = [
+#         shield.identifier
+#         for shield in filter(is_output_shield, await client.shields.list())
+#     ]
+#     if not available_input_shields and not available_output_shields:
+#         logger.info("No available shields. Disabling safety")
+#     else:
+#         logger.info(
+#             "Available input shields: %s, output shields: %s",
+#             available_input_shields,
+#             available_output_shields,
+#         )
+#     # use system prompt from request or default one
+#     system_prompt = get_system_prompt(query_request, configuration)
+#     logger.debug("Using system prompt: %s", system_prompt)
+
+#     # TODO(lucasagomes): redact attachments content before sending to LLM
+#     # if attachments are provided, validate them
+#     if query_request.attachments:
+#         validate_attachments_metadata(query_request.attachments)
+
+#     agent, conversation_id, session_id = await get_agent(
+#         client,
+#         model_id,
+#         system_prompt,
+#         available_input_shields,
+#         available_output_shields,
+#         query_request.conversation_id,
+#         query_request.no_tools or False,
+#     )
+
+#     logger.debug("Conversation ID: %s, session ID: %s", conversation_id, session_id)
+#     # bypass tools and MCP servers if no_tools is True
+#     if query_request.no_tools:
+#         mcp_headers = {}
+#         agent.extra_headers = {}
+#         toolgroups = None
+#     else:
+#         # preserve compatibility when mcp_headers is not provided
+#         logger.info("HELLOOOOOO")
+#         if mcp_headers is None:
+#             mcp_headers = {}
+#         mcp_headers = handle_mcp_headers_with_toolgroups(mcp_headers, configuration)
+#         if not mcp_headers and token:
+#             for mcp_server in configuration.mcp_servers:
+#                 mcp_headers[mcp_server.url] = {
+#                     "Authorization": f"Bearer {token}",
+#                 }
+
+#         agent.extra_headers = {
+#             "X-LlamaStack-Provider-Data": json.dumps(
+#                 {
+#                     "mcp_headers": mcp_headers,
+#                 }
+#             ),
+#         }
+
+#         logger.info("STARTING HERE")
+#         # Use specified vector stores or fetch all available ones
+#         if client.vector_dbs.list():
+#             logger.info("Vector db list: ", client.vector_dbs.list())
+#         if query_request.vector_store_ids:
+#             vector_db_ids = query_request.vector_store_ids
+#             logger.info("VECTOR_DB_IDS ",vector_db_ids)
+#         else:
+#             vector_db_ids = [
+#                 vector_store.id
+#                 for vector_store in (await client.vector_stores.list()).data
+#             ]
+#         toolgroups = (get_rag_toolgroups(vector_db_ids) or []) + [
+#             mcp_server.name for mcp_server in configuration.mcp_servers
+#         ]
+#         # Convert empty list to None for consistency with existing behavior
+#         if not toolgroups:
+#             toolgroups = None
+
+#     # TODO: LCORE-881 - Remove if Llama Stack starts to support these mime types
+#     # documents: list[Document] = [
+#     #     (
+#     #         {"content": doc["content"], "mime_type": "text/plain"}
+#     #         if doc["mime_type"].lower() in ("application/json", "application/xml")
+#     #         else doc
+#     #     )
+#     #     for doc in query_request.get_documents()
+#     # ]
+
+#     # Extract RAG chunks from vector DB query response BEFORE calling agent
+#     rag_chunks = []
+#     doc_ids_from_chunks = []
+#     retrieved_chunks = []
+#     retrieved_scores = []
+
+#     try:
+#         if vector_db_ids:
+#             vector_db_id = vector_db_ids[0]  # Use first available vector DB
+
+#             params = {"k": 5, "score_threshold": 0.0}
+#             logger.info("Initial params: %s", params)
+#             logger.info("query_request.solr: %s", query_request.solr)
+#             if query_request.solr:
+#                 # Pass the entire solr dict under the 'solr' key
+#                 params["solr"] = query_request.solr
+#                 logger.info("Final params with solr filters: %s", params)
+#             else:
+#                 logger.info("No solr filters provided")
+#             logger.info("Final params being sent to vector_io.query: %s", params)
+
+#             query_response = await client.vector_io.query(
+#                 vector_db_id=vector_db_id, query=query_request.query, params=params
+#             )
+
+#             logger.info("The query response total payload: %s", query_response)
+
+#             if query_response.chunks:
+#                 from models.responses import RAGChunk, ReferencedDocument
+
+#                 retrieved_chunks = query_response.chunks
+#                 retrieved_scores = (
+#                     query_response.scores if hasattr(query_response, "scores") else []
+#                 )
+
+#                 # Extract doc_ids from chunks for referenced_documents
+#                 metadata_doc_ids = set()
+#                 for chunk in query_response.chunks:
+#                     logger.info("Hitting the extract the doc ids in the chunks", chunk)
+#                     metadata = getattr(chunk, "metadata", None)
+#                     if metadata and "doc_id" in metadata:
+#                         reference_doc = metadata["doc_id"]
+#                         logger.info(reference_doc)
+#                         if reference_doc and reference_doc not in metadata_doc_ids:
+#                             metadata_doc_ids.add(reference_doc)
+#                             doc_ids_from_chunks.append(
+#                                 ReferencedDocument(
+#                                     doc_title=metadata.get("title", None),
+#                                     doc_url="https://mimir.corp.redhat.com"
+#                                     + reference_doc,
+#                                 )
+#                             )
+
+#                 logger.info(
+#                     "Extracted %d unique document IDs from chunks",
+#                     len(doc_ids_from_chunks),
+#                 )
+
+#     except Exception as e:
+#         logger.warning("Failed to query vector database for chunks: %s", e)
+#         logger.debug("Vector DB query error details: %s", traceback.format_exc())
+#         # Continue without RAG chunks
+
+#     # Convert retrieved chunks to RAGChunk format
+#     for i, chunk in enumerate(retrieved_chunks):
+#         # Extract source from chunk metadata based on OFFLINE flag
+#         source = None
+#         if chunk.metadata:
+#             if OFFLINE:
+#                 parent_id = chunk.metadata.get("parent_id")
+#                 if parent_id:
+#                     source = urljoin("https://mimir.corp.redhat.com", parent_id)
+#             else:
+#                 source = chunk.metadata.get("reference_url")
+
+#         # Get score from retrieved_scores list if available
+#         score = retrieved_scores[i] if i < len(retrieved_scores) else None
+
+#         rag_chunks.append(
+#             RAGChunk(
+#                 content=chunk.content,
+#                 source=source,
+#                 score=score,
+#             )
+#         )
+
+#     logger.info("Retrieved %d chunks from vector DB", len(rag_chunks))
+
+#     # Format RAG context for injection into user message
+#     rag_context = ""
+#     if rag_chunks:
+#         context_chunks = []
+#         for chunk in rag_chunks[:5]:  # Limit to top 5 chunks
+#             chunk_text = f"Source: {chunk.source or 'Unknown'}\n{chunk.content}"
+#             context_chunks.append(chunk_text)
+#         rag_context = "\n\nRelevant documentation:\n" + "\n\n".join(context_chunks)
+#         logger.info("Injecting %d RAG chunks into user message", len(context_chunks))
+
+#     # Inject RAG context into user message
+#     user_content = query_request.query + rag_context
+
+#     response = await agent.create_turn(
+#         messages=[UserMessage(role="user", content=user_content).model_dump()],
+#         session_id=session_id,
+#         # documents=documents,
+#         stream=False,
+#         toolgroups=toolgroups,
+#     )
+#     response = cast(Turn, response)
+
+#     summary = TurnSummary(
+#         llm_response=(
+#             content_to_str(response.output_message.content)
+#             if (
+#                 getattr(response, "output_message", None) is not None
+#                 and getattr(response.output_message, "content", None) is not None
+#             )
+#             else ""
+#         ),
+#         tool_calls=[],
+#         tool_results=[],
+#         rag_chunks=rag_chunks,
+#     )
+
+#     referenced_documents = parse_referenced_documents(response)
+
+#     # Update token count metrics and extract token usage in one call
+#     model_label = model_id.split("/", 1)[1] if "/" in model_id else model_id
+#     token_usage = extract_and_update_token_metrics(
+#         response, model_label, provider_id, system_prompt
+#     )
+
+#     # Check for validation errors in the response
+#     steps = response.steps or []
+#     for step in steps:
+#         if step.step_type == "shield_call" and step.violation:
+#             # Metric for LLM validation errors
+#             metrics.llm_calls_validation_errors_total.inc()
+#         if step.step_type == "tool_execution":
+#             summary.append_tool_calls_from_llama(step)
+
+#     if not summary.llm_response:
+#         logger.warning(
+#             "Response lacks output_message.content (conversation_id=%s)",
+#             conversation_id,
+#         )
+#     return (summary, conversation_id, referenced_documents, token_usage)
+
+
 def validate_attachments_metadata(attachments: list[Attachment]) -> None:
     """Validate the attachments metadata provided in the request.
 
@@ -614,3 +924,33 @@ def validate_attachments_metadata(attachments: list[Attachment]) -> None:
                 response="Invalid attribute value", cause=message
             )
             raise HTTPException(**response.model_dump())
+
+
+# def get_rag_toolgroups(
+#     vector_db_ids: list[str],
+# ) -> Optional[list[Toolgroup]]:
+#     """
+#     Return a list of RAG Tool groups if the given vector DB list is not empty.
+
+#     Generate a list containing a RAG knowledge search toolgroup if
+#     vector database IDs are provided.
+
+#     Parameters:
+#         vector_db_ids (list[str]): List of vector database identifiers to include in the toolgroup.
+
+#     Returns:
+#         Optional[list[Toolgroup]]: A list with a single RAG toolgroup if
+#         vector_db_ids is non-empty; otherwise, None.
+#     """
+#     return (
+#         [
+#             ToolgroupAgentToolGroupWithArgs(
+#                 name="builtin::rag/file_search",
+#                 args={
+#                     "vector_db_ids": vector_db_ids,
+#                 },
+#             )
+#         ]
+#         if vector_db_ids
+#         else None
+#     )
